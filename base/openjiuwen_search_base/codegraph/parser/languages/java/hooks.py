@@ -5,7 +5,7 @@ from functools import cached_property
 
 from ...custom_types import ModuleInfo
 from .. import LanguageHooks
-from .._common import module_path
+from .._common import module_path, posix_rel
 
 _JAVA_GENERIC_RE = re.compile(r"(\w+)<(.+)>$")
 
@@ -210,6 +210,7 @@ class JavaHooks(LanguageHooks):
         java_files = {f for f in file_names if f.endswith(".java")}
         if not java_files:
             return []
+        folder_rel = posix_rel(folder_rel)
         name = folder_rel.replace("/", ".") if folder_rel else "."
         path = module_path(root, folder_rel)
         return [ModuleInfo(name=name, language="java", path=path)]

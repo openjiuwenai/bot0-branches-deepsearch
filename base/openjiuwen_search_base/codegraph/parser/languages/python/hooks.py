@@ -6,7 +6,7 @@ from functools import cached_property
 
 from ...custom_types import ModuleInfo
 from .. import LanguageHooks
-from .._common import module_path
+from .._common import module_path, posix_rel
 
 _GENERIC_RE = re.compile(r"(\w+)\[(.+)]$")
 
@@ -105,6 +105,7 @@ class PythonHooks(LanguageHooks):
     ) -> list[ModuleInfo]:
         if "__init__.py" not in file_names:
             return []
+        folder_rel = posix_rel(folder_rel)
         name = folder_rel.replace("/", ".") if folder_rel else "."
         path = module_path(root, folder_rel)
         return [ModuleInfo(name=name, language="python", path=path)]

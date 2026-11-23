@@ -157,3 +157,33 @@ def test_java_extract_type_names():
     assert hooks.extract_type_names("MyClass") == ["MyClass"]
     assert hooks.extract_type_names("Optional<Bar>") == ["Bar"]
     assert hooks.extract_type_names("CompletableFuture<Result>") == ["Result"]
+
+
+# ---------------------------------------------------------------------------
+# Windows-style folder_rel: name and path must use the same normalised form
+# ---------------------------------------------------------------------------
+
+
+def test_detect_modules_normalises_windows_folder_rel():
+    register_builtins()
+    registry = get_default_registry()
+
+    mods = registry.get_hooks("python").detect_modules(
+        "a\\b\\c", frozenset({"__init__.py"}), "C:\\repo")
+    assert mods[0].name == "a.b.c"
+    assert mods[0].path == "C:/repo/a/b/c"
+
+    mods = registry.get_hooks("java").detect_modules(
+        "com\\example\\demo", frozenset({"Main.java"}), "C:\\repo")
+    assert mods[0].name == "com.example.demo"
+    assert mods[0].path == "C:/repo/com/example/demo"
+
+    mods = registry.get_hooks("go").detect_modules(
+        "internal\\pkg", frozenset({"pkg.go"}), "C:\\repo")
+    assert mods[0].name == "internal.pkg"
+    assert mods[0].path == "C:/repo/internal/pkg"
+
+    mods = registry.get_hooks("rust").detect_modules(
+        "src\\core", frozenset({"mod.rs"}), "C:\\repo")
+    assert mods[0].name == "src::core"
+    assert mods[0].path == "C:/repo/src/core"

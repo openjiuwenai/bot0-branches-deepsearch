@@ -7,6 +7,18 @@ from ..constants import MAX_AST_DEPTH
 from ..custom_types import SourceSpan
 
 
+def posix_rel(folder_rel: str) -> str:
+    """Normalize a relative path to POSIX separators.
+
+    ``graph_export`` builds ``folder_rel`` with ``str(Path(...))``, which yields
+    ``a\\b`` on Windows. Every consumer of ``folder_rel`` (module name *and*
+    module path) must start from the same normalized form, otherwise
+    ``ModuleInfo.name`` keeps backslashes while ``ModuleInfo.path`` is
+    POSIX-style and downstream name matching breaks on Windows.
+    """
+    return folder_rel.replace("\\", "/")
+
+
 def module_path(root: str, folder_rel: str) -> str:
     """Join *root* and *folder_rel* with forward slashes on every platform.
 
@@ -15,9 +27,10 @@ def module_path(root: str, folder_rel: str) -> str:
     yields ``\\root\\a\\b`` on Windows and breaks downstream comparisons.
     """
     root = root.replace("\\", "/")
+    folder_rel = posix_rel(folder_rel)
     if not folder_rel:
         return root
-    return posixpath.join(root, folder_rel.replace("\\", "/"))
+    return posixpath.join(root, folder_rel)
 
 
 def text(node: Node) -> str:
