@@ -63,3 +63,28 @@ def test_collect_repo_diff_works_without_commits(tmp_path):
 
     assert "staged" in patch
     assert "untracked" in patch
+
+
+def test_collect_repo_diff_handles_untracked_path_with_spaces(tmp_path):
+    repo = _init_repo(tmp_path)
+    (repo / "a.txt").write_text("a\n", encoding="utf-8")
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-q", "-m", "init")
+    (repo / "my file.txt").write_text("spaced\n", encoding="utf-8")
+
+    patch = collect_repo_diff(str(repo))
+
+    assert "my file.txt" in patch
+    assert "spaced" in patch
+
+
+def test_collect_repo_diff_does_not_embed_binary_payloads(tmp_path):
+    repo = _init_repo(tmp_path)
+    (repo / "a.txt").write_text("a\n", encoding="utf-8")
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-q", "-m", "init")
+    (repo / "blob.bin").write_bytes(b"\x00\x01\x02\x03" * 8)
+
+    patch = collect_repo_diff(str(repo))
+
+    assert "GIT binary patch" not in patch

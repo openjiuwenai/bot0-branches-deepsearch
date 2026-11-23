@@ -11,6 +11,8 @@
 
 import json
 import logging
+import os
+import subprocess
 from typing import Any, Optional
 
 from openjiuwen_codesearch.algorithm.memory_ops import construct_final_hits
@@ -403,61 +405,54 @@ async def resolver_tool_step(ctx: CodeResolveRunContext) -> Optional[Termination
     return None
 
 
+def _run_git(args, repo_dir: str, label: str, expect=(0,)):
+    """执行 git 命令，返回 ``(returncode, stdout)``。
+
+    ``check=False`` 时命令失败不会抛异常，stderr 也不会出现在 stdout 里——不主动
+    读它，"命令失败"就会被当成"没有输出"，用户拿到的 patch 无声地少掉一部分。
+    """
+    result = subprocess.run(
+        ["git", *args], cwd=repo_dir, capture_output=True, text=True, check=False
+    )
+    if result.returncode not in expect:
+        logger.warning(
+            "git %s failed (rc=%s): %s", label, result.returncode, result.stderr.strip()
+        )
+    return result.returncode, result.stdout
+
+
 def collect_repo_diff(repo_dir: str) -> str:
     """收集工作区相对 HEAD 的完整 diff（含未跟踪的新文件），不改写 git 索引。
 
     旧实现是 ``git add -A`` → ``git diff --cached`` → ``git reset``：``add -A`` 会把
     未跟踪文件（可能含密钥、构建产物）一并塞进 patch，随后的 ``git reset`` 又抹掉了
     用户原本已暂存的内容——注释说"避免污染用户的 index"，实际是覆盖它。
-    """
-    import os
-    import subprocess
 
-    diff = subprocess.run(
-        ["git", "diff", "HEAD", "--binary"],
-        cwd=repo_dir,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if diff.returncode == 0:
-        patch = diff.stdout
+    不加 ``--binary``：二进制文件会被整段编码进 patch，体积成倍膨胀；不带该参数时
+    git 只输出一行 "Binary files ... differ"，对文本 patch 已经够用。
+    """
+    if _run_git(["rev-parse", "--verify", "HEAD"], repo_dir, "rev-parse HEAD")[0] == 0:
+        patch = _run_git(["diff", "HEAD"], repo_dir, "diff HEAD")[1]
     else:
         # 空仓库没有 HEAD：分别取工作区与暂存区的 diff
-        patch = subprocess.run(
-            ["git", "diff", "--binary"],
-            cwd=repo_dir,
-            capture_output=True,
-            text=True,
-            check=False,
-        ).stdout
-        patch += subprocess.run(
-            ["git", "diff", "--cached", "--binary"],
-            cwd=repo_dir,
-            capture_output=True,
-            text=True,
-            check=False,
-        ).stdout
+        patch = _run_git(["diff"], repo_dir, "diff")[1]
+        patch += _run_git(["diff", "--cached"], repo_dir, "diff --cached")[1]
 
-    untracked = subprocess.run(
-        ["git", "ls-files", "--others", "--exclude-standard"],
-        cwd=repo_dir,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    for relative_path in untracked.stdout.splitlines():
-        relative_path = relative_path.strip()
+    # -z：路径里可能出现空格、引号或换行，默认输出会给特殊字符加引号并转义，
+    # 再去 strip() 反而把文件名改坏；NUL 分隔拿到的就是原始路径。
+    untracked = _run_git(
+        ["ls-files", "--others", "--exclude-standard", "-z"], repo_dir, "ls-files"
+    )[1]
+    for relative_path in untracked.split("\0"):
         if not relative_path:
             continue
-        new_file = subprocess.run(
-            ["git", "diff", "--no-index", "--binary", "--", os.devnull, relative_path],
-            cwd=repo_dir,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        patch += new_file.stdout
+        # --no-index 用 1 表示"两边有差异"，属正常返回
+        patch += _run_git(
+            ["diff", "--no-index", "--", os.devnull, relative_path],
+            repo_dir,
+            "diff --no-index",
+            expect=(0, 1),
+        )[1]
     return patch
 
 
