@@ -1,3 +1,5 @@
+import logging
+
 import pytest
 
 from openjiuwen_deepsearch.algorithm.report.report import (
@@ -86,7 +88,26 @@ def test_deduplicate_and_renumber_with_ignore_lines_without_reference():
     text = "This is not a ref\n[1] Valid reference"
     result, mapping = _deduplicate_and_renumber_ref(text)
     assert result == "[1] Valid reference"
+    # 行首 [1] 视为新块边界，前面那行非引用内容自成一个（空）段
+    assert mapping == {"2-1": 1}
+
+
+def test_deduplicate_and_renumber_ref_splits_blocks_on_leading_index_one():
+    """历史调用形态：各段落引用块用单个 \\n 拼接，每块首行是 [1]。"""
+    text = "[1] A\n[2] B\n[1] C\n[2] D"
+    result, mapping = _deduplicate_and_renumber_ref(text)
+    assert result == "[1] A\n\n[2] B\n\n[3] C\n\n[4] D"
+    # 两块各自独立编号，第二块不应覆盖第一块的映射
+    assert mapping == {"1-1": 1, "1-2": 2, "2-1": 3, "2-2": 4}
+
+
+def test_deduplicate_and_renumber_refs_keeps_first_mapping_on_duplicate_key(caplog):
+    """同一段出现重复原编号时保留首次映射并告警，避免引用被静默改指。"""
+    with caplog.at_level(logging.WARNING):
+        result, mapping = _deduplicate_and_renumber_refs(["[1] A\n[1] B"])
+    assert result == "[1] A\n\n[2] B"
     assert mapping == {"1-1": 1}
+    assert any("Duplicate reference key '1-1'" in record.message for record in caplog.records)
 
 
 @pytest.mark.parametrize("paragraphs, classified_contents, ref_map, expected", [

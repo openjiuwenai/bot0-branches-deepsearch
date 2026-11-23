@@ -44,18 +44,62 @@ def _deduplicate_and_renumber_refs(
                 seen[content] = next_index
                 renumbered.append(f"[{next_index}] {content}")
                 next_index += 1
-            mapping[f"{paragraph_no}-{match.group(1)}"] = seen[content]
+            key = f"{paragraph_no}-{match.group(1)}"
+            if key in mapping:
+                # 同一个 key 只可能来自"同一段落里重复出现同一原编号"。此时后一行
+                # 若直接覆盖，前一条文献的映射会被静默丢弃，消费端会把引用改指到
+                # 后一条文献上（正是本模块要修的"引用张冠李戴"），因此保留首次
+                # 映射并告警，由调用方决定是否修正输入。
+                if mapping[key] != seen[content]:
+                    logger.warning(
+                        "Duplicate reference key '%s' in paragraph %d: keep the first "
+                        "mapping (-> %d), ignore the later one (-> %d). Citation numbers "
+                        "may point to the wrong reference; check the reference block.",
+                        key, paragraph_no, mapping[key], seen[content],
+                    )
+                continue
+            mapping[key] = seen[content]
 
     return "\n\n".join(renumbered), mapping
+
+
+def _split_ref_blocks(raw_text: str) -> list[str]:
+    """把单段文本切成引用块。
+
+    兼容入口的历史调用形态是把各段落的引用块用单个 ``\\n`` 拼起来（每块首行
+    是 ``[1]``），只按空行切分会让多个段落塌进同一段、并因 ``f"{n}-1"`` 键
+    冲突互相覆盖映射。因此这里恢复旧实现的启发式：空行、或"行首再次出现
+    ``[1]``"都视为新块的边界。
+    """
+    if not raw_text.strip():
+        return []
+    blocks: list[list[str]] = []
+    current: list[str] = []
+    for line in raw_text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            if current:
+                blocks.append(current)
+                current = []
+            continue
+        match = _REF_LINE_RE.match(stripped)
+        if match is not None and match.group(1) == "1" and current:
+            blocks.append(current)
+            current = [line]
+            continue
+        current.append(line)
+    if current:
+        blocks.append(current)
+    return ["\n".join(block) for block in blocks]
 
 
 def _deduplicate_and_renumber_ref(raw_text: str) -> tuple[str, dict[str, int]]:
     """单段文本入口，保留给旧调用方；新代码请用 :func:`_deduplicate_and_renumber_refs`。
 
-    空行分隔的多个引用块按顺序当作多个段落，段落号不再随空行数漂移。
+    空行分隔的多个引用块按顺序当作多个段落；块内再次出现行首 ``[1]`` 也当作
+    新段落（历史调用形态），段落号不再随空行数漂移。
     """
-    blocks = [b for b in re.split(r"\n\s*\n", raw_text.strip())] if raw_text.strip() else []
-    return _deduplicate_and_renumber_refs(blocks)
+    return _deduplicate_and_renumber_refs(_split_ref_blocks(raw_text))
 
 
 def _replace_citations_and_classified_index(
