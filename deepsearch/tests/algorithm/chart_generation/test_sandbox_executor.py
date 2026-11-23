@@ -4,6 +4,7 @@
 
 import asyncio
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -116,3 +117,67 @@ def test_legit_write_and_read_inside_workdir_still_work(executor):
 
     assert result["error"] is False, result["stderr"]
     assert "ok" in result["stdout"]
+
+
+def test_os_symlink_to_outside_allowlist_is_denied(executor):
+    """symlink 的 src 也要校验：否则可先挂链、再顺着链接读取白名单外的文件。
+
+    守卫在真正调用 os.symlink 之前就拒绝，因此该用例不依赖平台是否允许创建
+    符号链接。
+    """
+    link = Path(executor.working_dir) / "_sandbox_denied_link"
+    code = (
+        "import os\n"
+        f"os.symlink({_lit(OUTSIDE_DIR)}, {_lit(link)})\n"
+        "print('linked')\n"
+    )
+    result = _run(executor, code)
+
+    assert result["error"] is True
+    assert "PermissionError" in result["stderr"]
+    assert not link.exists()
+
+
+def test_read_through_symlink_cannot_escape_workdir(executor):
+    """已存在的符号链接指向白名单外时，读取必须按真实目标（realpath）判定。"""
+    secret = OUTSIDE_DIR / "_sandbox_symlink_secret.txt"
+    link = Path(executor.working_dir) / "_sandbox_outside_link"
+    secret.write_text("secret\n", encoding="utf-8")
+    try:
+        os.symlink(str(OUTSIDE_DIR), str(link), target_is_directory=True)
+    except (OSError, NotImplementedError) as exc:  # pragma: no cover - 环境不支持符号链接
+        secret.unlink(missing_ok=True)
+        pytest.skip(f"cannot create symlink: {exc}")
+    try:
+        code = (
+            "from pathlib import Path\n"
+            "print(Path('_sandbox_outside_link/_sandbox_symlink_secret.txt').read_text())\n"
+        )
+        result = _run(executor, code)
+
+        assert result["error"] is True
+        assert "PermissionError" in result["stderr"]
+        assert "secret" not in result["stdout"]
+    finally:
+        link.unlink(missing_ok=True)
+        secret.unlink(missing_ok=True)
+
+
+def test_symlink_inside_workdir_is_still_allowed(executor):
+    """白名单内的符号链接不能被误伤。"""
+    code = (
+        "from pathlib import Path\n"
+        "import os\n"
+        "Path('_sandbox_link_target.txt').write_text('ok', encoding='utf-8')\n"
+        "os.symlink('_sandbox_link_target.txt', '_sandbox_link_alias.txt')\n"
+        "print(Path('_sandbox_link_alias.txt').read_text(encoding='utf-8'))\n"
+    )
+    result = _run(executor, code)
+
+    if result["error"] is True:
+        # Windows 默认不允许普通用户创建符号链接（WinError 1314），此时跳过而非判失败
+        if "WinError 1314" in result["stderr"] or "privilege" in result["stderr"].lower():
+            pytest.skip("environment cannot create symlinks")
+    assert result["error"] is False, result["stderr"]
+    assert "ok" in result["stdout"]
+

@@ -12,6 +12,7 @@
                os.open / os.remove 等删除改名类 os.* 接口（不只拦 builtins.open）
 4. 读取限制  — 仅允许读取工作目录、临时目录、系统库目录等安全白名单路径
                禁止读取 /etc、/root、/home 等系统敏感路径
+               白名单比较使用 realpath（而非 abspath），避免符号链接指到白名单外
 5. 系统调用限制 — 禁用 os.system, os.popen, os.startfile, os.posix_spawn, os.fork
                等可执行外部命令的接口
 6. 超时控制  — 执行超时自动 SIGKILL 终止子进程
@@ -393,6 +394,21 @@ if _font_path and os.path.isfile(_font_path):
     if _font_dir not in _read_dirs:
         _read_dirs.append(_font_dir)
 
+def _real(_p):
+    """解析出真实目标路径：展开符号链接后再做平台归一化。
+
+    abspath 只做字符串拼接、不展开符号链接，因此"先 os.symlink("/etc", "d")，
+    再 open("d/hostname")"这类两行代码即可让 abspath 落在工作目录内从而放行，
+    而内核跟随符号链接后实际打开的是 /etc/hostname。白名单必须比较 realpath。
+    """
+    _rp = os.path.realpath(os.path.abspath(str(_p)))
+    return os.path.normcase(_rp) if os.name == "nt" else _rp
+
+
+# 白名单目录本身也按真实路径归一化（macOS 的 tmpdir、Windows 的大小写/8.3 名）
+_write_dirs = [_real(_d) for _d in _write_dirs]
+_read_dirs = [_real(_d) for _d in _read_dirs]
+
 _high_risk_paths = [
     "/etc", "/root", "/home", "/var/log", "/var/lib",
     "/proc", "/sys", "/dev", "/run", "/opt",
@@ -419,7 +435,7 @@ def _deny_read(_abs, file):
 
 def _check_write(file, what="Writing"):
     """写入/删除类操作统一校验：只允许工作目录与临时目录。"""
-    _abs = os.path.abspath(str(file))
+    _abs = _real(file)
     if not _is_under(_abs, _write_dirs):
         raise PermissionError(
             f"{what} to '{file}' is not allowed. "
@@ -429,7 +445,7 @@ def _check_write(file, what="Writing"):
 
 
 def _safe_open(file, mode="r", *a, **kw):
-    _abs = os.path.abspath(str(file))
+    _abs = _real(file)
     # 写入限制：只允许写入工作目录和临时目录
     if any(m in mode for m in ("w", "a", "x", "+")):
         _check_write(file)
@@ -467,8 +483,10 @@ def _safe_os_open(path, flags, mode=0o777, *, dir_fd=None):
         raise PermissionError("os.open(dir_fd=...) is not allowed in the sandbox.")
     if flags & _WRITE_FLAGS:
         _check_write(path)
-    elif not _is_under(os.path.abspath(str(path)), _read_dirs):
-        _deny_read(os.path.abspath(str(path)), path)
+    else:
+        _abs = _real(path)
+        if not _is_under(_abs, _read_dirs):
+            _deny_read(_abs, path)
     return _orig_os_open(path, flags, mode)
 
 
@@ -509,6 +527,32 @@ for _fn_name, _indexes in _WRITE_PATH_OPS.items():
     _orig_fn = getattr(_os, _fn_name, None)
     if _orig_fn is not None:
         setattr(_os, _fn_name, _make_write_guard(_fn_name, _orig_fn, _indexes))
+
+# symlink/link 的 src 是之后会被读取的真实目标：只校验 dst 等于允许在沙箱内
+# 挂一个指向 /etc 的链接，再 open("link/hostname") 即绕过读取白名单。
+_READ_PATH_OPS = {
+    "symlink": (0,),
+    "link": (0,),
+}
+
+
+def _make_read_guard(_fn_name, _orig_fn, _indexes):
+    def _guarded(*a, **kw):
+        for _i in _indexes:
+            if len(a) > _i:
+                _abs = _real(a[_i])
+                if not _is_under(_abs, _read_dirs):
+                    _deny_read(_abs, a[_i])
+        return _orig_fn(*a, **kw)
+
+    _guarded.__name__ = _fn_name
+    return _guarded
+
+
+for _fn_name, _indexes in _READ_PATH_OPS.items():
+    _orig_fn = getattr(_os, _fn_name, None)
+    if _orig_fn is not None:
+        setattr(_os, _fn_name, _make_read_guard(_fn_name, _orig_fn, _indexes))
 
 # ── Dangerous os functions ──────────────────────────────────────
 for _fn_name in (
