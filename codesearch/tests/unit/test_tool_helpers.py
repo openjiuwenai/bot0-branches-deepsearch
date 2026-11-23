@@ -28,3 +28,24 @@ def test_copy_path_literal_uses_forward_slashes():
 
 def test_copy_path_literal_escapes_double_quote():
     assert _copy_path_literal(Path('/tmp/we"ird.csv')) == '/tmp/we""ird.csv'
+
+
+def test_split_command_unquotes_token_inner_quotes(monkeypatch):
+    monkeypatch.setattr("openjiuwen_codesearch.algorithm.coder_tools.run_bash.os.name", "nt")
+    assert split_command('echo a"b c"d') == ["echo", "ab cd"]
+
+
+def test_split_command_keeps_unpaired_quote(monkeypatch):
+    monkeypatch.setattr("openjiuwen_codesearch.algorithm.coder_tools.run_bash.os.name", "nt")
+    assert split_command("echo it's") == ["echo", "it's"]
+
+
+
+def test_split_command_escapes_quote_after_slashes(monkeypatch):
+    monkeypatch.setattr("openjiuwen_codesearch.algorithm.coder_tools.run_bash.os.name", "nt")
+    assert split_command(r'echo a\"b') == ["echo", 'a"b']
+
+
+def test_split_command_keeps_windows_path_inside_quotes(monkeypatch):
+    monkeypatch.setattr("openjiuwen_codesearch.algorithm.coder_tools.run_bash.os.name", "nt")
+    assert split_command(r'copy "C:\tmp dir\a.txt" dst') == ["copy", r"C:\tmp dir\a.txt", "dst"]

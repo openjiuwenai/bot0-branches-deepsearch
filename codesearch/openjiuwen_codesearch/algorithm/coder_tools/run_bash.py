@@ -5,20 +5,54 @@ import subprocess
 from .registry import ToolSpec, ToolOutcome
 
 
-def split_command(command: str) -> list[str]:
-    """把命令行拆成参数列表，按平台选择分词规则。
+def _split_windows(command: str) -> list[str]:
+    """按 Windows 命令行规则（CommandLineToArgvW）拆参数。
 
-    POSIX 模式下 ``shlex.split`` 把反斜杠当转义符，Windows 路径
-    ``C:\\tmp\\a.txt`` 会被拆成 ``C:tmpa.txt``，命令直接执行失败。Windows 上改用
-    非 POSIX 模式，并去掉成对包裹的引号（非 POSIX 模式会保留引号）。
+    POSIX 的 shlex 把反斜杠当转义符，会吃掉 ``C:\\tmp`` 里的分隔符；
+    ``posix=False`` 又只在 token 以引号开头时才当引用，``a"b c"d`` 会被拆成
+    ``a"b`` 和 ``c"d``。这里按 Windows 自己的规则分词：反斜杠只在双引号前成对
+    转义（n 个反斜杠加一个引号，输出 n // 2 个反斜杠，奇数个再补一个字面量
+    引号），双引号内的空格不分割，其余位置的反斜杠原样保留。
     """
+    args: list[str] = []
+    current: list[str] = []
+    in_quotes = False
+    pending_slashes = 0
+    has_token = False
+    for char in command:
+        if char == "\\":
+            pending_slashes += 1
+            continue
+        if char == '"':
+            current.extend("\\" * (pending_slashes // 2))
+            if pending_slashes % 2:
+                current.append('"')
+            else:
+                in_quotes = not in_quotes
+                has_token = True
+            pending_slashes = 0
+            continue
+        current.extend("\\" * pending_slashes)
+        pending_slashes = 0
+        if char in " \t" and not in_quotes:
+            if current or has_token:
+                args.append("".join(current))
+            current = []
+            has_token = False
+            continue
+        current.append(char)
+        has_token = True
+    current.extend("\\" * pending_slashes)
+    if current or has_token:
+        args.append("".join(current))
+    return args
+
+
+def split_command(command: str) -> list[str]:
+    """把命令行拆成参数列表，按平台选择分词规则。"""
     if os.name != "nt":
         return shlex.split(command)
-    parts = shlex.split(command, posix=False)
-    return [
-        part[1:-1] if len(part) >= 2 and part[0] == part[-1] and part[0] in "\"'" else part
-        for part in parts
-    ]
+    return _split_windows(command)
 
 
 async def execute(ctx, args: dict) -> ToolOutcome:
