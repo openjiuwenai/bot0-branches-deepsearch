@@ -98,3 +98,65 @@ def test_split_section_by_h2_handles_duplicate_titles():
     assert [sub["content"] for sub in sub_sections] == ["甲内容", "乙内容"]
     assert [sub["index_h2"] for sub in sub_sections] == [0, 1]
 
+
+
+
+def test_split_report_by_h1_fence_must_match_char_and_length():
+    """~~~ 关不掉 ```，短围栏也关不掉长围栏，里面的 # 行不能当标题。"""
+    report = (
+        "# 报告标题\n\n"
+        "# 1. 第一章\n\n"
+        "````markdown\n"
+        "~~~\n"
+        "\n"
+        "# 仍是代码块的注释\n"
+        "````\n\n"
+        "# 2. 第二章\n\n正文二\n"
+    )
+    sections = FigurePlaceholderGenerator._split_report_by_h1(report)
+
+    assert [section["title"] for section in sections] == ["1. 第一章", "2. 第二章"]
+    assert "仍是代码块的注释" in sections[0]["content"]
+
+
+def test_split_report_by_h1_short_fence_cannot_close_long_fence():
+    report = (
+        "# 报告标题\n\n"
+        "# 1. 第一章\n\n"
+        "````\n"
+        "```\n"
+        "\n"
+        "# 代码块里的注释\n"
+        "````\n\n"
+        "# 2. 第二章\n\n正文二\n"
+    )
+    sections = FigurePlaceholderGenerator._split_report_by_h1(report)
+
+    assert [section["title"] for section in sections] == ["1. 第一章", "2. 第二章"]
+
+
+def test_split_report_by_h1_unclosed_fence_falls_back_to_plain_text():
+    """文件末尾半个代码块不能把后面的章节吞掉。"""
+    report = (
+        "# 报告标题\n\n"
+        "# 1. 第一章\n\n"
+        "```python\nprint(1)\n\n"
+        "# 2. 第二章\n\n正文二\n"
+    )
+    sections = FigurePlaceholderGenerator._split_report_by_h1(report)
+
+    assert [section["title"] for section in sections] == ["1. 第一章", "2. 第二章"]
+    assert "print(1)" in sections[0]["content"]
+    assert sections[1]["content"] == "正文二"
+
+
+def test_split_report_by_h1_keeps_titled_first_h1_with_long_body():
+    """首个 H1 没有章节号，但下面已是成段正文，说明它是正文首章而非总标题。"""
+    report = (
+        "# 背景与现状\n\n"
+        + "这是一段正文。" * 60
+        + "\n\n# 1. 第一章\n\n正文一\n"
+    )
+    sections = FigurePlaceholderGenerator._split_report_by_h1(report)
+
+    assert [section["title"] for section in sections] == ["背景与现状", "1. 第一章"]

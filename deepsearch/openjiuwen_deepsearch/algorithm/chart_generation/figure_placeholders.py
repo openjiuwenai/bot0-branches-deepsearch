@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 _H1_LINE_RE = re.compile(r"^#\s+(.+?)\s*$")
 _H2_LINE_RE = re.compile(r"^##\s+(.+?)\s*$")
-_FENCE_LINE_RE = re.compile(r"^\s*(```|~~~)")
+_FENCE_LINE_RE = re.compile(r"^[ \t]*(?P<fence>`{3,}|~{3,})(?P<info>.*)$")
 _CHAPTER_TITLE_RE = re.compile(
     r"^(第\s*[0-9一二三四五六七八九十百千]+\s*[章节篇]"
     r"|[0-9]+\s*[.、)）]"
@@ -49,6 +49,67 @@ _EXCLUDED_TITLES = frozenset(
 )
 
 
+# 总标题的正文一般不超过这个长度；超过说明这已经是正文首章
+_FIRST_TITLE_MAX_BODY = 200
+
+
+def _looks_like_report_title(block: Dict[str, str], has_following: bool) -> bool:
+    """判断首个 H1 是不是整篇报告的总标题。
+
+    只看标题形态不够：``# 2025 年行业观察`` 没有章节号，但它就是正文第一章。
+    所以再叠加结构信号——总标题通常只有标题行、正文为空或极短，且后面还有别的
+    H1；正文成段的 H1 一律当正文首章保留。
+    """
+    if _CHAPTER_TITLE_RE.match(block.get("title") or ""):
+        return False
+    if not has_following:
+        return False
+    body = (block.get("content") or "").strip()
+    return not body or len(body) <= _FIRST_TITLE_MAX_BODY
+
+
+def _scan_fences(lines: List[str], ignored: "set[int]") -> Tuple["set[int]", int]:
+    """扫描围栏代码块，返回（完整代码块的行号集合, 未闭合围栏的行号）。
+
+    闭合行必须与开启行同字符且不短于开启长度（``~~~`` 关不掉 ````` `````），
+    也不允许带 info string；开启行的 info string 里出现反引号时不是围栏。
+    """
+    fenced: "set[int]" = set()
+    open_char = ""
+    open_len = 0
+    open_idx = -1
+    for idx, raw in enumerate(lines):
+        if idx in ignored:
+            continue
+        match = _FENCE_LINE_RE.match(raw.rstrip("\r\n"))
+        if not match:
+            continue
+        fence = match.group("fence")
+        char, length = fence[0], len(fence)
+        if not open_char:
+            if char == "`" and "`" in match.group("info"):
+                continue
+            open_char, open_len, open_idx = char, length, idx
+        elif char == open_char and length >= open_len and not match.group("info").strip():
+            fenced.update(range(open_idx, idx + 1))
+            open_char, open_len, open_idx = "", 0, -1
+    return fenced, open_idx
+
+
+def _fenced_lines(lines: List[str]) -> "set[int]":
+    """返回完整围栏代码块覆盖的行号。
+
+    文件末尾没闭合的围栏按普通文本处理：否则半个代码块会把后面的标题全吞掉，
+    报告直接少掉几章。
+    """
+    ignored: "set[int]" = set()
+    while True:
+        fenced, unclosed = _scan_fences(lines, ignored)
+        if unclosed < 0:
+            return fenced
+        ignored.add(unclosed)
+
+
 def _split_by_heading(content: str, pattern: "re.Pattern[str]") -> List[Dict[str, str]]:
     """按标题行切分 *content*，返回 ``[{"title", "content"}, ...]``。
 
@@ -57,20 +118,21 @@ def _split_by_heading(content: str, pattern: "re.Pattern[str]") -> List[Dict[str
     围栏代码块（``` / ~~~）内的行不参与切分，避免把 ``# 注释`` 当成标题。
     """
     blocks: List[Dict[str, str]] = []
-    in_fence = False
+    lines = content.splitlines(keepends=True)
+    fenced = _fenced_lines(lines)
     offset = 0
     current = None
 
-    for line in content.splitlines(keepends=True):
-        if _FENCE_LINE_RE.match(line):
-            in_fence = not in_fence
-        elif not in_fence:
-            match = pattern.match(line.rstrip("\r\n"))
-            if match:
-                if current is not None:
-                    current["content"] = content[current.pop("_start"):offset].strip()
-                current = {"title": match.group(1).strip(), "_start": offset + len(line)}
-                blocks.append(current)
+    for idx, line in enumerate(lines):
+        if idx in fenced:
+            offset += len(line)
+            continue
+        match = pattern.match(line.rstrip("\r\n"))
+        if match:
+            if current is not None:
+                current["content"] = content[current.pop("_start"):offset].strip()
+            current = {"title": match.group(1).strip(), "_start": offset + len(line)}
+            blocks.append(current)
         offset += len(line)
 
     if current is not None:
@@ -167,9 +229,10 @@ class FigurePlaceholderGenerator:
             normalized_title = re.sub(r"\s+", " ", section["title"]).strip().casefold()
             if normalized_title in _EXCLUDED_TITLES:
                 continue
-            # 首个 H1 通常是报告标题（不带章节号）。若正文直接从"第一章 / 1."开始，
-            # 说明报告没有总标题，此时不能按位置把它当标题丢掉。
-            if position == 0 and not _CHAPTER_TITLE_RE.match(section["title"]):
+            # 首个 H1 通常是报告标题（不带章节号、正文为空）。若正文直接从
+            # "第一章 / 1." 开始，或该 H1 下面已经是成段正文，说明报告没有总标题，
+            # 此时不能按位置把它当标题丢掉。
+            if position == 0 and _looks_like_report_title(section, len(blocks) > 1):
                 continue
             report_sections.append(section)
 
