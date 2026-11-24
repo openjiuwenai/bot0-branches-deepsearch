@@ -160,3 +160,56 @@ def test_split_report_by_h1_keeps_titled_first_h1_with_long_body():
     sections = FigurePlaceholderGenerator._split_report_by_h1(report)
 
     assert [section["title"] for section in sections] == ["背景与现状", "1. 第一章"]
+
+
+def test_split_report_by_h1_drops_numbered_title_with_toc_body():
+    """总标题恰好以章节号开头（``# 1. xxx``）且下面跟着目录/摘要时，仍要当标题丢掉。"""
+    report = (
+        "# 1. 2025年行业观察\n\n"
+        "## 目录\n\n"
+        "1. 行业概况 .............. 3\n"
+        "2. 竞争格局 .............. 7\n"
+        "3. 趋势判断 .............. 12\n\n"
+        "## 摘要\n\n"
+        "本报告从行业概况、竞争格局、趋势判断三个角度展开，"
+        "基于公开数据与访谈记录对 2025 年的行业走向给出判断，"
+        "并对关键变量做了敏感性分析，供决策参考。\n\n"
+        "# 1. 行业概况\n\n正文一\n\n"
+        "# 2. 竞争格局\n\n正文二\n"
+    )
+    sections = FigurePlaceholderGenerator._split_report_by_h1(report)
+
+    assert [section["title"] for section in sections] == ["1. 行业概况", "2. 竞争格局"]
+    assert [section["index"] for section in sections] == [1, 2]
+
+
+def test_split_report_by_h1_drops_title_with_long_preface_body():
+    """总标题没有章节号、但正文是整篇目录时，不能被当成正文首章。"""
+    report = (
+        "# 2025年行业观察\n\n"
+        "1. 行业概况 .............. 3\n"
+        "2. 竞争格局 .............. 7\n"
+        "3. 趋势判断 .............. 12\n\n"
+        "# 1. 行业概况\n\n正文一\n\n"
+        "# 2. 竞争格局\n\n正文二\n"
+    )
+    sections = FigurePlaceholderGenerator._split_report_by_h1(report)
+
+    assert [section["title"] for section in sections] == ["1. 行业概况", "2. 竞争格局"]
+
+
+def test_split_report_by_h1_ignores_indented_fence_as_code_block():
+    """缩进 4 格（或 tab）的围栏是缩进代码块，不能当围栏开关把后面的章节吞掉。"""
+    report = (
+        "# 1. 第一章\n\n"
+        "    示例：\n\n"
+        "    ```\n"
+        "    echo before\n"
+        "\n"
+        "# 2. 第二章\n\n正文二\n"
+        "    ```\n"
+    )
+    sections = FigurePlaceholderGenerator._split_report_by_h1(report)
+
+    assert [section["title"] for section in sections] == ["1. 第一章", "2. 第二章"]
+    assert sections[1]["content"] == "正文二\n    ```"

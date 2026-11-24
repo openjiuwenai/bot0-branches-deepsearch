@@ -24,7 +24,9 @@ logger = logging.getLogger(__name__)
 
 _H1_LINE_RE = re.compile(r"^#\s+(.+?)\s*$")
 _H2_LINE_RE = re.compile(r"^##\s+(.+?)\s*$")
-_FENCE_LINE_RE = re.compile(r"^[ \t]*(?P<fence>`{3,}|~{3,})(?P<info>.*)$")
+# 围栏最多缩进 3 个空格；缩进 4 格（或一个 tab）在 Markdown 里是缩进代码块，
+# 里面的 ``` 只是示例文本，不能当成围栏开关，否则会把后面的 H1 全吞进代码块
+_FENCE_LINE_RE = re.compile(r"^ {0,3}(?P<fence>`{3,}|~{3,})(?P<info>.*)$")
 _CHAPTER_TITLE_RE = re.compile(
     r"^(第\s*[0-9一二三四五六七八九十百千]+\s*[章节篇]"
     r"|[0-9]+\s*[.、)）]"
@@ -49,23 +51,52 @@ _EXCLUDED_TITLES = frozenset(
 )
 
 
-# 总标题的正文一般不超过这个长度；超过说明这已经是正文首章
+# 总标题的正文一般不超过这个长度；超过且不是前言，说明这已经是正文首章
 _FIRST_TITLE_MAX_BODY = 200
+
+# 目录行：标题 + 点线/省略号引导符 + 页码
+_TOC_LINE_RE = re.compile(r"^.{1,80}?(?:\.{3,}|…{2,}|·{3,})\s*\d{1,4}\s*$")
+# 前言小节标题：目录 / 摘要 / Table of Contents ...
+_PREFACE_HEADING_RE = re.compile(
+    r"^#{1,6}\s*(?:"
+    + "|".join(re.escape(title) for title in sorted(_EXCLUDED_TITLES))
+    + r")\s*$",
+    re.IGNORECASE,
+)
+
+
+def _is_preface_body(body: str) -> bool:
+    """判断首个 H1 下面的内容是不是"前言"（目录 / 摘要），而不是正文首章。
+
+    报告总标题下面经常跟着目录或摘要，这些内容有固定形态：带点线和页码的目录行，
+    或 "目录 / 摘要" 小节标题。据此可以把"总标题 + 前言"和"正文直接从第一章开始"
+    区分开，而不必依赖标题有没有章节号。
+    """
+    lines = [line.strip() for line in body.splitlines() if line.strip()]
+    if not lines:
+        return True
+    if any(_PREFACE_HEADING_RE.match(line) for line in lines):
+        return True
+    toc_lines = sum(1 for line in lines if _TOC_LINE_RE.match(line))
+    return toc_lines >= 2 and toc_lines * 2 >= len(lines)
 
 
 def _looks_like_report_title(block: Dict[str, str], has_following: bool) -> bool:
     """判断首个 H1 是不是整篇报告的总标题。
 
-    只看标题形态不够：``# 2025 年行业观察`` 没有章节号，但它就是正文第一章。
-    所以再叠加结构信号——总标题通常只有标题行、正文为空或极短，且后面还有别的
-    H1；正文成段的 H1 一律当正文首章保留。
+    只看标题形态会两头出错：``# 2025 年行业观察`` 没有章节号，但它可能是正文第一章；
+    反过来，大纲标题也可能恰好长成 ``# 1. 2025 年行业观察``。所以按结构信号判断：
+    后面还有别的 H1，且正文为空、是目录/摘要这种前言、或短到不成段，才算总标题。
+    标题形态只在"正文极短又不像前言"时兜底：带章节号的仍当正文首章保留。
     """
-    if _CHAPTER_TITLE_RE.match(block.get("title") or ""):
-        return False
     if not has_following:
         return False
     body = (block.get("content") or "").strip()
-    return not body or len(body) <= _FIRST_TITLE_MAX_BODY
+    if _is_preface_body(body):
+        return True
+    if _CHAPTER_TITLE_RE.match(block.get("title") or ""):
+        return False
+    return len(body) <= _FIRST_TITLE_MAX_BODY
 
 
 def _scan_fences(lines: List[str], ignored: "set[int]") -> Tuple["set[int]", int]:
