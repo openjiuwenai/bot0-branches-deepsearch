@@ -88,8 +88,9 @@ def test_deduplicate_and_renumber_with_ignore_lines_without_reference():
     text = "This is not a ref\n[1] Valid reference"
     result, mapping = _deduplicate_and_renumber_ref(text)
     assert result == "[1] Valid reference"
-    # 行首 [1] 视为新块边界，前面那行非引用内容自成一个（空）段
-    assert mapping == {"2-1": 1}
+    # 只有"当前块已含有效引用"时行首 [1] 才算新段落起点；开头的非引用行
+    # （如 ## References 标题）与后面的引用属于同一块，段落号不后移。
+    assert mapping == {"1-1": 1}
 
 
 def test_deduplicate_and_renumber_ref_splits_blocks_on_leading_index_one():
@@ -140,11 +141,13 @@ def test_deduplicate_and_renumber_refs_keeps_first_mapping_on_duplicate_key(capl
     ),
 
     # 测试用例3：没有分类内容
+    #   重编号只看该段落自己的引用块映射，不依赖分类资料是否齐全；
+    #   资料缺失时正文编号仍按引用块改写，避免旧编号在下游碰巧命中别的章节。
     (
             ["This is a paragraph [citation:1].", "Another paragraph [citation:2]."],
             [],
             {"1-1": 10, "2-2": 20},
-            (["This is a paragraph [citation:1].", "Another paragraph [citation:2]."], [])
+            (["This is a paragraph [citation:10].", "Another paragraph [citation:20]."], [])
     ),
 
     # 测试用例4：空段落及分类内容
@@ -191,3 +194,82 @@ def test_replace_citations_uses_paragraph_id_from_block_order():
     )
     assert updated_paragraphs == ["P0 [citation:1]", "P1 [citation:3]"]
     assert updated_classified[1][0]["index"] == 3
+
+
+def test_replace_citations_uses_own_block_when_classified_contents_is_short():
+    """资料列表偏短时，第二章的 [citation:1] 仍要按它自己的引用块改成 [citation:2]。
+
+    旧实现只有在 classified_contents 里有条目时才重写正文，第二章的 [citation:1]
+    会原样保留，下游按全局编号溯源就链接到了第一章的文献 A。
+    """
+    ref_map = {"1-1": 1, "2-1": 2}
+    paragraphs = ["Ch1 [citation:1]", "Ch2 [citation:1]"]
+    classified = [[{"index": 1, "content": "A"}]]
+
+    updated_paragraphs, updated_classified = _replace_citations_and_classified_index(
+        paragraphs, classified, ref_map
+    )
+
+    assert updated_paragraphs == ["Ch1 [citation:1]", "Ch2 [citation:2]"]
+    assert updated_classified == [[{"index": 1, "content": "A"}]]
+
+
+def test_replace_citations_marks_unresolvable_citation(caplog):
+    """段落引用了自己引用块里没有的编号时，明确标记为不可解析而不是原样保留。"""
+    ref_map = {"1-1": 5}
+    with caplog.at_level(logging.WARNING):
+        updated_paragraphs, _ = _replace_citations_and_classified_index(
+            ["P0 [citation:1] [citation:2]"], [], ref_map
+        )
+    assert updated_paragraphs == ["P0 [citation:5] [citation:?]"]
+    assert any("unresolved" in record.message for record in caplog.records)
+
+
+def test_replace_citations_pairs_sections_by_original_index():
+    """中间章节正文为空时，第三个章节要用第三组资料，而不是第二组。"""
+    paragraphs = ["Ch1 [citation:1]", "Ch3 [citation:1]"]
+    classified = [
+        [{"index": 1, "content": "A"}],
+        [],
+        [{"index": 1, "content": "C"}],
+    ]
+    ref_map = {"1-1": 1, "2-1": 2}
+
+    updated_paragraphs, updated_classified = _replace_citations_and_classified_index(
+        paragraphs, classified, ref_map, section_indexes=[0, 2]
+    )
+
+    assert updated_paragraphs == ["Ch1 [citation:1]", "Ch3 [citation:2]"]
+    assert [item["index"] for item in updated_classified[0]] == [1]
+    assert updated_classified[1] == []
+    assert [item["index"] for item in updated_classified[2]] == [2]
+
+
+def test_refresh_reference_keeps_section_alignment_with_empty_section():
+    """报告组装跳过空章节后，资料仍按原始章节下标配对。"""
+    result = Reporter.refresh_reference(
+        ["Ch1 [citation:1]", "Ch3 [citation:1]"],
+        ["[1] A", "[1] C"],
+        [[{"index": 1, "content": "A"}], [], [{"index": 1, "content": "C"}]],
+        [0, 2],
+    )
+
+    assert result["sub_reports_content"] == "Ch1 [citation:1]\n\nCh3 [citation:2]"
+    assert result["sub_references"] == "[1] A\n\n[2] C"
+    assert [item["index"] for item in result["refreshed_all_classified_contents"][2]] == [2]
+
+
+def test_deduplicate_and_renumber_ref_normalizes_leading_zero_index():
+    """参考文献写成 [02] 时按整数归一化，映射键要与资料 index 对得上。"""
+    text = "[1] B\n[02] C"
+    result, mapping = _deduplicate_and_renumber_ref(text)
+    assert result == "[1] B\n\n[2] C"
+    assert mapping == {"1-1": 1, "1-2": 2}
+
+
+def test_deduplicate_and_renumber_ref_keeps_reference_title_block():
+    """单字符串入口带 ## References 标题时，标题不能自成一个空段落。"""
+    text = "## References\n[1] A\n[2] B"
+    result, mapping = _deduplicate_and_renumber_ref(text)
+    assert result == "[1] A\n\n[2] B"
+    assert mapping == {"1-1": 1, "1-2": 2}

@@ -324,6 +324,9 @@ class Reporter(
         """Process sub reports"""
         sub_reports_content = []
         sub_references = []
+        # 保留下来的章节在 all_classified_contents 中的原始下标。
+        # 正文为空的章节会被跳过，列表不再按下标对齐，重编号时必须用它配对资料。
+        section_indexes = []
         all_classified_contents = self.gen_report_context.get(
             "all_classified_contents", []
         )
@@ -457,10 +460,11 @@ class Reporter(
             else:
                 sub_references.append("")
                 sub_reports_content.append(section_content.strip())
+            section_indexes.append(index)
         logger.info(f"子章节标题重排记录：{outline_renum.history}")
 
         return self.refresh_reference(
-            sub_reports_content, sub_references, all_classified_contents
+            sub_reports_content, sub_references, all_classified_contents, section_indexes
         )
 
     async def generate_sub_report(

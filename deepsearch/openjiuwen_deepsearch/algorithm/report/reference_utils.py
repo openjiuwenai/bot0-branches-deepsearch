@@ -44,7 +44,10 @@ def _deduplicate_and_renumber_refs(
                 seen[content] = next_index
                 renumbered.append(f"[{next_index}] {content}")
                 next_index += 1
-            key = f"{paragraph_no}-{match.group(1)}"
+            # 原编号一律按整数归一化：参考文献写成 "[02]" 时，消费端按资料 index
+            # （整数 2）拼出的键是 "段落-2"，保留原始字符串会拼出 "段落-02" 而查不到。
+            orig_no = int(match.group(1))
+            key = f"{paragraph_no}-{orig_no}"
             if key in mapping:
                 # 同一个 key 只可能来自"同一段落里重复出现同一原编号"。此时后一行
                 # 若直接覆盖，前一条文献的映射会被静默丢弃，消费端会把引用改指到
@@ -68,25 +71,33 @@ def _split_ref_blocks(raw_text: str) -> list[str]:
 
     兼容入口的历史调用形态是把各段落的引用块用单个 ``\\n`` 拼起来（每块首行
     是 ``[1]``），只按空行切分会让多个段落塌进同一段、并因 ``f"{n}-1"`` 键
-    冲突互相覆盖映射。因此这里恢复旧实现的启发式：空行、或"行首再次出现
-    ``[1]``"都视为新块的边界。
+    冲突互相覆盖映射。因此这里恢复旧实现的启发式：空行、或"块内已有引用后
+    再次出现行首 ``[1]``"都视为新块的边界。
+
+    首行是 ``## References`` 这类标题时，标题后面的 ``[1]`` 是同一块的第一条
+    引用而不是新段落起点，否则整块会被标题行占走、映射键整体后移一段。
     """
     if not raw_text.strip():
         return []
     blocks: list[list[str]] = []
     current: list[str] = []
+    current_has_ref = False
     for line in raw_text.splitlines():
         stripped = line.strip()
         if not stripped:
             if current:
                 blocks.append(current)
                 current = []
+                current_has_ref = False
             continue
         match = _REF_LINE_RE.match(stripped)
-        if match is not None and match.group(1) == "1" and current:
+        if match is not None and int(match.group(1)) == 1 and current_has_ref:
             blocks.append(current)
             current = [line]
+            current_has_ref = True
             continue
+        if match is not None:
+            current_has_ref = True
         current.append(line)
     if current:
         blocks.append(current)
@@ -102,55 +113,86 @@ def _deduplicate_and_renumber_ref(raw_text: str) -> tuple[str, dict[str, int]]:
     return _deduplicate_and_renumber_refs(_split_ref_blocks(raw_text))
 
 
+def _paragraph_ref_map(ref_map: dict[str, int], paragraph_no: int) -> dict[str, int]:
+    """取出某个段落自己的 ``{原编号: 新编号}`` 映射。"""
+    prefix = f"{paragraph_no}-"
+    return {
+        key[len(prefix):]: value
+        for key, value in ref_map.items()
+        if key.startswith(prefix)
+    }
+
+
 def _replace_citations_and_classified_index(
     paragraphs: list[str],
     classified_contents: list[list[dict]],
     ref_map: dict[str, int],
+    section_indexes: list[int] | None = None,
 ) -> tuple[list[str], list[list[dict]]]:
-    if not ref_map or not classified_contents:
+    """按段落自己的引用块重写 ``[citation:N]``，并同步资料条目的 index。
+
+    重编号直接用该段落引用块给出的映射，不再依赖 ``classified_contents`` 是否
+    完整：资料列表偏短时，正文该改的编号照样要改，否则第二章的 ``[citation:1]``
+    会原样保留、在下游碰巧链接到第一章的文献。
+
+    ``section_indexes[i]`` 给出第 i 段正文对应的 ``classified_contents`` 下标。
+    报告组装会跳过正文为空的章节，正文列表与资料列表因此不再按下标对齐
+    （中间章节为空时，后面章节会读到上一章的资料并把引用改错）。
+
+    段落引用了自己引用块里不存在的编号时，输入本身已经损坏，原编号在全局表里
+    可能"碰巧"命中别的章节的文献，因此改写为 ``[citation:?]`` 并告警，
+    而不是原样保留一个指向错误文献的编号。
+    """
+    if not ref_map:
         return paragraphs, classified_contents
 
+    classified_contents = classified_contents or []
     updated_paragraphs: list[str] = []
-    updated_classified_contents: list[list[dict]] = []
+    updated_classified_contents = [list(items) for items in classified_contents]
+    unresolved: list[tuple[int, str]] = []
 
     for i, para in enumerate(paragraphs):
-        if i >= len(classified_contents):
-            updated_paragraphs.append(para)
-            continue
-        sub_classified_contents = classified_contents[i]
-        if not sub_classified_contents:
-            updated_paragraphs.append(para)
-            updated_classified_contents.append([])
-            continue
+        paragraph_no = i + 1
+        para_map = _paragraph_ref_map(ref_map, paragraph_no)
 
-        # Build index mapping: original index -> new number
-        index_map = {
-            str(item["index"]): ref_map.get(f"{i + 1}-{item['index']}")
-            for item in sub_classified_contents
-        }
+        def _replace(match, _map=para_map, _para_no=paragraph_no):
+            new_index = _map.get(match.group(1))
+            if new_index is None:
+                unresolved.append((_para_no, match.group(0)))
+                return "[citation:?]"
+            return f"[citation:{new_index}]"
 
         # 单次替换：逐条 re.sub 会把上一轮刚换好的编号当成原文编号再换一次
         # （1->2、2->3 时 [citation:1] 会被连换两次）。
-        updated_para = _CITATION_RE.sub(
-            lambda m: (
-                f"[citation:{index_map[m.group(1)]}]"
-                if index_map.get(m.group(1)) is not None
-                else m.group(0)
-            ),
-            para,
+        updated_paragraphs.append(_CITATION_RE.sub(_replace, para))
+
+        target_index = (
+            section_indexes[i]
+            if section_indexes is not None and i < len(section_indexes)
+            else i
         )
-        updated_paragraphs.append(updated_para)
+        if not 0 <= target_index < len(updated_classified_contents):
+            continue
+        sub_classified_contents = updated_classified_contents[target_index]
+        if not sub_classified_contents:
+            continue
 
         # Update index field in reference entries
         updated_sub_classified_content: list[dict] = []
         for item in sub_classified_contents:
             updated_item = item.copy()
-            final_index = index_map.get(str(item["index"]))
+            final_index = para_map.get(str(item["index"]))
             if final_index is not None:
                 updated_item["index"] = final_index
             updated_sub_classified_content.append(updated_item)
+        updated_classified_contents[target_index] = updated_sub_classified_content
 
-        updated_classified_contents.append(updated_sub_classified_content)
+    if unresolved:
+        logger.warning(
+            "Citations without a matching reference in their own paragraph were "
+            "marked as unresolved: %s",
+            unresolved[:10],
+        )
 
     return updated_paragraphs, updated_classified_contents
 
@@ -175,8 +217,18 @@ class ReferenceMixin:
         return sub_section_content
 
     @staticmethod
-    def refresh_reference(sub_reports_content, sub_references, all_classified_contents):
-        """Refresh references"""
+    def refresh_reference(
+        sub_reports_content,
+        sub_references,
+        all_classified_contents,
+        section_indexes=None,
+    ):
+        """Refresh references
+
+        ``section_indexes``：第 i 段正文对应的原始章节下标。报告组装会跳过正文
+        为空的章节，正文/引用块列表与 ``all_classified_contents`` 因此可能不再
+        按下标对齐，需要显式传入对应关系（不传则沿用按下标对齐的旧语义）。
+        """
         refreshed_references = ""
         raw_references = "\n".join(sub_references) if sub_references else ""
         if raw_references:
@@ -187,7 +239,10 @@ class ReferenceMixin:
                 logger.info("refreshed_references: [%s]", refreshed_references)
             sub_reports_content, all_classified_contents = (
                 _replace_citations_and_classified_index(
-                    sub_reports_content, all_classified_contents, ref_map
+                    sub_reports_content,
+                    all_classified_contents,
+                    ref_map,
+                    section_indexes,
                 )
             )
 
