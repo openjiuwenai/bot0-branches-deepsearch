@@ -145,7 +145,8 @@ _FONT_CANDIDATES = [
 # Worker script — 在隔离子进程中执行，通过 stdin 注入
 # ────────────────────────────────────────────────────────────────
 _WORKER_SCRIPT = r'''
-import sys, os, io, json, builtins, traceback, tempfile, importlib, hashlib, hmac
+import sys, os, io, json, builtins, traceback, tempfile
+import importlib, importlib.util, hashlib, hmac
 
 _cfg = json.loads(os.environ["_SANDBOX_CFG"])
 _working_dir = os.path.abspath(_cfg["working_dir"])
@@ -219,23 +220,80 @@ except Exception:
 # ════════════════════════════════════════════════════════════════
 
 # ── Import restriction ──────────────────────────────────────────
+# 限制判断必须发生在"模块名解析之后"：相对导入（".subprocess"）与
+# "from pkg import submodule" 拿到的原始名字都不等于最终模块名，
+# 只看原始字符串会漏掉 asyncio.subprocess 这类子模块条目。
 _orig_import = builtins.__import__
+_orig_import_module = importlib.import_module
 
-def _safe_import(name, *args, **kwargs):
-    if _is_restricted(name):
-        raise ImportError(f"Importing '{name}' is not allowed in the code sandbox.")
-    return _orig_import(name, *args, **kwargs)
+
+def _absolute_module_name(name, package=None, level=0):
+    """把导入名解析成绝对模块名；解析失败时原样返回，交给 import 机制报错。"""
+    _name = str(name)
+    if not package:
+        return _name
+    if _name.startswith("."):
+        try:
+            return importlib.util.resolve_name(_name, package)
+        except Exception:
+            return _name
+    if level:
+        try:
+            return importlib.util.resolve_name("." * level + _name, package)
+        except Exception:
+            return _name
+    return _name
+
+
+def _deny_restricted_module(name):
+    raise ImportError(f"Importing '{name}' is not allowed in the code sandbox.")
+
+
+def _check_import_target(absolute_name, fromlist=None):
+    """按绝对模块名校验导入目标，含 fromlist 里的包成员。"""
+    if _is_restricted(absolute_name):
+        _deny_restricted_module(absolute_name)
+    for _item in fromlist or ():
+        if isinstance(_item, str) and _item and _item != "*":
+            if _is_restricted(absolute_name + "." + _item):
+                _deny_restricted_module(absolute_name + "." + _item)
+
+
+def _safe_import(name, globals=None, locals=None, fromlist=(), level=0):
+    _pkg = None
+    if level and isinstance(globals, dict):
+        _pkg = globals.get("__package__") or globals.get("__name__")
+    _check_import_target(_absolute_module_name(name, _pkg, level), fromlist)
+    return _orig_import(name, globals, locals, fromlist, level)
+
 
 builtins.__import__ = _safe_import
 
-_orig_import_module = importlib.import_module
 
 def _safe_import_module(name, package=None):
-    if _is_restricted(name):
-        raise ImportError(f"Importing '{name}' is not allowed in the code sandbox.")
+    _check_import_target(_absolute_module_name(name, package))
     return _orig_import_module(name, package)
 
+
 importlib.import_module = _safe_import_module
+
+
+class _RestrictedModuleFinder:
+    """兜底守卫：import 系统解析出的每个绝对模块名都要过一遍限制名单。
+
+    __import__ / import_module 两个入口之外，还有 "from pkg import sub"、
+    importlib 内部按绝对名补全等路径；meta_path 是它们共同的必经点，
+    因此把判断集中在这里，再做前缀匹配。
+    """
+
+    @staticmethod
+    def find_spec(fullname, path=None, target=None):
+        if _is_restricted(fullname):
+            _deny_restricted_module(fullname)
+        return None
+
+
+sys.meta_path.insert(0, _RestrictedModuleFinder)
 
 # ── sys.modules cleanup and encapsulation ───────────────────────────
 # Phase 1 可能已经预加载了某些危险模块（如 ctypes，某些库内部使用）
@@ -388,11 +446,38 @@ for _p in _site_packages:
         _abs_p = os.path.abspath(_p)
         if _abs_p not in _read_dirs:
             _read_dirs.append(_abs_p)
-# 允许读取字体文件
-if _font_path and os.path.isfile(_font_path):
-    _font_dir = os.path.abspath(os.path.dirname(_font_path))
-    if _font_dir not in _read_dirs:
-        _read_dirs.append(_font_dir)
+# 允许读取字体资产（只读）
+# matplotlib 的字体是在渲染阶段才按需打开的（fontManager 懒加载），而不是在
+# Phase 1 导入库时。只放行 kt_font.ttf 自身的目录会让默认字体、数学字体与
+# fontconfig 缓存全部读不到，parse/渲染直接失败，而上层又把它当成"没有图"。
+_font_dirs = []
+if _font_path:
+    _font_dirs.append(os.path.dirname(_font_path))
+try:
+    import matplotlib as _mpl_ref_fonts
+    _font_dirs.append(os.path.join(_mpl_ref_fonts.get_data_path(), "fonts"))
+except Exception:
+    pass
+if os.name == "nt":
+    _windir = os.environ.get("WINDIR") or os.environ.get("SystemRoot") or r"C:\Windows"
+    _font_dirs.append(os.path.join(_windir, "Fonts"))
+    _local_appdata = os.environ.get("LOCALAPPDATA")
+    if _local_appdata:
+        # 用户安装的字体（Windows 10+ 允许无管理员权限装字体）
+        _font_dirs.append(os.path.join(_local_appdata, "Microsoft", "Windows", "Fonts"))
+else:
+    _font_dirs.extend([
+        "/usr/share/fonts",
+        "/usr/local/share/fonts",
+        os.path.expanduser("~/.fonts"),
+        os.path.expanduser("~/.local/share/fonts"),
+    ])
+for _font_dir in _font_dirs:
+    if not _font_dir:
+        continue
+    _abs_font_dir = os.path.abspath(_font_dir)
+    if os.path.isdir(_abs_font_dir) and _abs_font_dir not in _read_dirs:
+        _read_dirs.append(_abs_font_dir)
 
 def _real(_p):
     """解析出真实目标路径：展开符号链接后再做平台归一化。
@@ -444,19 +529,73 @@ def _check_write(file, what="Writing"):
     return _abs
 
 
-def _safe_open(file, mode="r", *a, **kw):
+def _check_read(file):
+    """读取类操作统一校验，返回解析后的真实路径。"""
     _abs = _real(file)
-    # 写入限制：只允许写入工作目录和临时目录
+    if not _is_under(_abs, _read_dirs):
+        _deny_read(_abs, file)
+    return _abs
+
+
+def _bind_path_call(_fn_name, _pos_names, _kwonly_names, _required_names, _args, _kwargs):
+    """按被包装函数的真实参数名绑定实参。
+
+    只按位置下标取 path 会漏掉 `os.remove(path=...)`、`os.rename(src=..., dst=...)`、
+    `open(file=...)` 这类关键字调用：参数在 kwargs 里，下标取不到，守卫等于
+    直接放行。这里先做参数绑定，取不到目标路径的调用形式一律拒绝，
+    不把未校验的调用转交给底层。
+    """
+    _allowed = set(_pos_names) | set(_kwonly_names)
+    if len(_args) > len(_pos_names):
+        raise PermissionError(
+            f"{_fn_name}() called with too many positional arguments; "
+            f"the target path cannot be verified in the sandbox."
+        )
+    _unknown = [k for k in _kwargs if k not in _allowed]
+    if _unknown:
+        raise PermissionError(
+            f"{_fn_name}() got unsupported argument(s) {_unknown}; "
+            f"the target path cannot be verified in the sandbox."
+        )
+    _bound = {}
+    for _i, _value in enumerate(_args):
+        _bound[_pos_names[_i]] = _value
+    for _key, _value in _kwargs.items():
+        if _key in _bound:
+            raise TypeError(
+                f"{_fn_name}() got multiple values for argument '{_key}'"
+            )
+        _bound[_key] = _value
+    # dir_fd 类参数会把相对路径解析到别的目录，无法校验，直接拒绝
+    for _fd_name in ("dir_fd", "src_dir_fd", "dst_dir_fd"):
+        if _bound.get(_fd_name) is not None:
+            raise PermissionError(
+                f"{_fn_name}({_fd_name}=...) is not allowed in the sandbox."
+            )
+    for _name in _required_names:
+        if _name not in _bound:
+            raise TypeError(f"{_fn_name}() missing required argument: '{_name}'")
+    return _bound
+
+
+def _safe_open(file, mode="r", buffering=-1, encoding=None, errors=None,
+               newline=None, closefd=True, opener=None):
+    # 已经拿到的文件描述符不是路径，无法也不需要在路径层面校验
+    if isinstance(file, int):
+        return _orig_open(file, mode, buffering, encoding, errors, newline, closefd)
+    if opener is not None:
+        # opener 可以忽略传入路径、直接返回任意 fd，校验不到真实目标
+        raise PermissionError("open(opener=...) is not allowed in the sandbox.")
     if any(m in mode for m in ("w", "a", "x", "+")):
-        _check_write(file)
-    # 读取限制：只允许读取安全白名单路径
-    # 防止恶意代码读取服务账号可访问的任意敏感文件
+        # 写入限制：只允许写入工作目录和临时目录；校验与打开使用同一路径
+        _target = _check_write(file)
     elif "r" in mode:
-        # 允许读取不存在的文件（后续操作会自然报错）
-        # 但禁止读取敏感路径下的文件
-        if not _is_under(_abs, _read_dirs):
-            _deny_read(_abs, file)
-    return _orig_open(file, mode, *a, **kw)
+        # 读取限制：只允许读取安全白名单路径
+        # 允许读取不存在的文件（后续操作会自然报错），但禁止读取敏感路径
+        _target = _check_read(file)
+    else:
+        _target = _real(file)
+    return _orig_open(_target, mode, buffering, encoding, errors, newline, closefd)
 
 
 builtins.open = _safe_open
@@ -482,77 +621,59 @@ def _safe_os_open(path, flags, mode=0o777, *, dir_fd=None):
     if dir_fd is not None:
         raise PermissionError("os.open(dir_fd=...) is not allowed in the sandbox.")
     if flags & _WRITE_FLAGS:
-        _check_write(path)
+        _target = _check_write(path)
     else:
-        _abs = _real(path)
-        if not _is_under(_abs, _read_dirs):
-            _deny_read(_abs, path)
-    return _orig_os_open(path, flags, mode)
+        _target = _check_read(path)
+    return _orig_os_open(_target, flags, mode)
 
 
 _os.open = _safe_os_open
 
 # 删除/改名/建目录等写操作同样受写入白名单约束：
 # 否则 os.remove / os.rename 可以删掉或覆盖任意文件。
-_WRITE_PATH_OPS = {
-    "remove": (0,),
-    "unlink": (0,),
-    "rmdir": (0,),
-    "removedirs": (0,),
-    "mkdir": (0,),
-    "makedirs": (0,),
-    "truncate": (0,),
-    "chmod": (0,),
-    "utime": (0,),
-    "rename": (0, 1),
-    "renames": (0, 1),
-    "replace": (0, 1),
-    "symlink": (1,),
-    "link": (0, 1),
+# 每个条目：(位置参数顺序, 仅关键字参数, 写路径参数, 读路径参数)
+_PATH_OP_SPECS = {
+    "remove": (("path",), ("dir_fd",), ("path",), ()),
+    "unlink": (("path",), ("dir_fd",), ("path",), ()),
+    "rmdir": (("path",), ("dir_fd",), ("path",), ()),
+    "removedirs": (("name",), (), ("name",), ()),
+    "mkdir": (("path", "mode"), ("dir_fd",), ("path",), ()),
+    "makedirs": (("name", "mode", "exist_ok"), (), ("name",), ()),
+    "truncate": (("path", "length"), (), ("path",), ()),
+    "chmod": (("path", "mode"), ("dir_fd", "follow_symlinks"), ("path",), ()),
+    "utime": (("path", "times"), ("ns", "dir_fd", "follow_symlinks"), ("path",), ()),
+    "rename": (("src", "dst"), ("src_dir_fd", "dst_dir_fd"), ("src", "dst"), ()),
+    "renames": (("old", "new"), (), ("old", "new"), ()),
+    "replace": (("src", "dst"), ("src_dir_fd", "dst_dir_fd"), ("src", "dst"), ()),
+    # symlink/link 的 src 是之后会被读取的真实目标：只校验 dst 等于允许在沙箱内
+    # 挂一个指向 /etc 的链接，再 open("link/hostname") 即绕过读取白名单。
+    "symlink": (("src", "dst", "target_is_directory"), ("dir_fd",), ("dst",), ("src",)),
+    "link": (("src", "dst"), ("src_dir_fd", "dst_dir_fd"), ("dst",), ("src",)),
 }
 
 
-def _make_write_guard(_fn_name, _orig_fn, _indexes):
+def _make_path_guard(_fn_name, _orig_fn, _spec):
+    _pos_names, _kwonly_names, _write_names, _read_names = _spec
+    _required_names = tuple(_write_names) + tuple(_read_names)
+
     def _guarded(*a, **kw):
-        for _i in _indexes:
-            if len(a) > _i:
-                _check_write(a[_i], what=_fn_name)
+        _bound = _bind_path_call(
+            _fn_name, _pos_names, _kwonly_names, _required_names, a, kw
+        )
+        for _name in _write_names:
+            _check_write(_bound[_name], what=_fn_name)
+        for _name in _read_names:
+            _check_read(_bound[_name])
         return _orig_fn(*a, **kw)
 
     _guarded.__name__ = _fn_name
     return _guarded
 
 
-for _fn_name, _indexes in _WRITE_PATH_OPS.items():
+for _fn_name, _spec in _PATH_OP_SPECS.items():
     _orig_fn = getattr(_os, _fn_name, None)
     if _orig_fn is not None:
-        setattr(_os, _fn_name, _make_write_guard(_fn_name, _orig_fn, _indexes))
-
-# symlink/link 的 src 是之后会被读取的真实目标：只校验 dst 等于允许在沙箱内
-# 挂一个指向 /etc 的链接，再 open("link/hostname") 即绕过读取白名单。
-_READ_PATH_OPS = {
-    "symlink": (0,),
-    "link": (0,),
-}
-
-
-def _make_read_guard(_fn_name, _orig_fn, _indexes):
-    def _guarded(*a, **kw):
-        for _i in _indexes:
-            if len(a) > _i:
-                _abs = _real(a[_i])
-                if not _is_under(_abs, _read_dirs):
-                    _deny_read(_abs, a[_i])
-        return _orig_fn(*a, **kw)
-
-    _guarded.__name__ = _fn_name
-    return _guarded
-
-
-for _fn_name, _indexes in _READ_PATH_OPS.items():
-    _orig_fn = getattr(_os, _fn_name, None)
-    if _orig_fn is not None:
-        setattr(_os, _fn_name, _make_read_guard(_fn_name, _orig_fn, _indexes))
+        setattr(_os, _fn_name, _make_path_guard(_fn_name, _orig_fn, _spec))
 
 # ── Dangerous os functions ──────────────────────────────────────
 for _fn_name in (
@@ -660,15 +781,26 @@ with _orig_open(_code_path, "r", encoding="utf-8") as _code_file:
 
 # 执行用户代码（使用隔离命名空间，不是 globals()）
 # 关键安全点：用户代码无法访问沙箱内部变量如 _orig_open, _restricted 等
+_status = 0
 try:
     exec(compile(_user_code_content, "<sandbox>", "exec"), _exec_namespace)
-except Exception:
+except SystemExit as _exit_exc:
+    _status = _exit_exc.code if isinstance(_exit_exc.code, int) else 1
+except BaseException:
     traceback.print_exc()
-    sys.exit(1)
-finally:
-    # finally 块在隔离命名空间外运行，可以访问沙箱内部变量
+    _status = 1
+
+# 收集图表：渲染失败必须作为执行错误上报。
+# 之前整段包在 try/except Exception: pass 里，字体读取被拒、渲染异常都变成
+# "没有输出"，上层只看到 chart_base64=None 且 error=False，重试也拿不到原因。
+# 未安装 matplotlib 时没有图表能力，按"无图"处理，不算执行错误。
+try:
+    import matplotlib.pyplot as _plt
+except Exception:
+    _plt = None
+
+if _plt is not None:
     try:
-        import matplotlib.pyplot as _plt
         import base64 as _b64
         import io as _io
         # 获取所有活跃的figures并转换为base64
@@ -693,12 +825,14 @@ finally:
                         _sig = hmac.new(_hmac_secret.encode(), _chart_b64.encode(), hashlib.sha256).hexdigest()
                         print(f"__CHART_RESULT_SIGNATURE__: {_sig}")
         _plt.close("all")
-        # 显式释放内存
-        del _figs
-        del _buf
-        del _chart_b64
-    except Exception:
-        pass
+    except BaseException as _render_exc:
+        print(
+            "__CHART_RENDER_ERROR__: %s: %s" % (type(_render_exc).__name__, _render_exc),
+            file=sys.stderr,
+        )
+        if _status == 0:
+            _status = 3
+sys.exit(_status)
 '''
 
 
@@ -958,10 +1092,14 @@ class AsyncCodeExecutor:
             sanitized_stdout = _sanitize_output(stdout)
             sanitized_stderr = _sanitize_output(stderr)
 
+            # 渲染阶段失败必须算执行失败：不能返回 error=False + chart_base64=None，
+            # 否则上层只会以为"没有图"，拿不到字体/渲染这类真实原因。
+            render_failed = "__CHART_RENDER_ERROR__" in stderr
+
             return {
                 "stdout": sanitized_stdout if sanitized_stdout.strip() else "Run completed with no output.",
                 "stderr": sanitized_stderr,
-                "error": proc.returncode != 0,
+                "error": proc.returncode != 0 or render_failed,
                 "chart_base64": chart_base64,
             }
 

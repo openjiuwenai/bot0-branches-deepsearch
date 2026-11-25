@@ -3,6 +3,8 @@
 """沙箱逃逸回归用例：读写白名单、子模块黑名单、进程启动入口。"""
 
 import asyncio
+import base64
+import importlib.util
 import json
 import os
 import sys
@@ -16,6 +18,9 @@ from openjiuwen_deepsearch.algorithm.chart_generation.sandbox.sandbox_executor i
 
 # 用测试文件所在目录作为"仓库外"路径：它既不在工作目录，也不在系统临时目录
 OUTSIDE_DIR = Path(__file__).resolve().parent
+
+_HAS_MPL = importlib.util.find_spec("matplotlib") is not None
+requires_matplotlib = pytest.mark.skipif(not _HAS_MPL, reason="matplotlib 未安装")
 
 
 @pytest.fixture(scope="module")
@@ -180,4 +185,82 @@ def test_symlink_inside_workdir_is_still_allowed(executor):
             pytest.skip("environment cannot create symlinks")
     assert result["error"] is False, result["stderr"]
     assert "ok" in result["stdout"]
+
+
+def test_keyword_call_forms_are_still_guarded(executor):
+    """关键字传参不能绕过守卫：`open(file=...)`、`os.remove(path=...)` 等。
+
+    旧实现只按位置下标取路径，参数写在 kwargs 里时下标取不到，守卫形同虚设。
+    """
+    cases = {
+        "open": "open(file={p}, mode='w')\n",
+        "remove": "import os\nos.remove(path={p})\n",
+        "rename": "import os\nos.rename(src={p}, dst='moved.txt')\n",
+        "mkdir": "import os\nos.mkdir(path={p})\n",
+    }
+    target = OUTSIDE_DIR / "_sandbox_denied_keyword.txt"
+    target.write_text("keep me\n", encoding="utf-8")
+    try:
+        for name, snippet in cases.items():
+            code = snippet.format(p=_lit(target))
+            result = _run(executor, code)
+            assert result["error"] is True, name
+            assert "PermissionError" in result["stderr"], (name, result["stderr"])
+        assert target.exists()
+    finally:
+        target.unlink(missing_ok=True)
+
+
+def test_from_import_of_restricted_submodule_is_blocked(executor):
+    """`from asyncio import subprocess` 与 importlib 相对导入都要按解析后的模块名判定。"""
+    for code in (
+        "from asyncio import subprocess\nprint('imported')\n",
+        "import importlib\nimportlib.import_module('.subprocess', 'asyncio')\nprint('imported')\n",
+    ):
+        result = _run(executor, code)
+        assert result["error"] is True, code
+        assert "ImportError" in result["stderr"], result["stderr"]
+        assert "imported" not in result["stdout"]
+
+
+@requires_matplotlib
+def test_plain_line_chart_still_returns_png(executor):
+    """端到端：带中文轴标签的普通折线图必须回传有效 PNG。
+
+    字体是在渲染阶段才按需读取的，读写白名单若把字体目录一起拦掉，
+    就会退化成 chart_base64=None 且 error=False。
+    """
+    code = (
+        "import matplotlib.pyplot as plt\n"
+        "fig, ax = plt.subplots()\n"
+        "ax.plot([1, 2, 3], [3, 1, 2])\n"
+        "ax.set_title('销售趋势')\n"
+        "ax.set_xlabel('月份')\n"
+        "ax.set_ylabel('销售额（万元）')\n"
+        "plt.tight_layout()\n"
+    )
+    result = _run(executor, code)
+
+    assert result["error"] is False, result["stderr"]
+    assert result["chart_base64"], result["stderr"]
+    assert base64.b64decode(result["chart_base64"])[:8] == b"\x89PNG\r\n\x1a\n"
+
+
+@requires_matplotlib
+def test_render_failure_is_reported_as_error(executor):
+    """渲染失败不能静默成“没有图”，必须作为执行错误返回。"""
+    code = (
+        "import matplotlib.pyplot as plt\n"
+        "fig, ax = plt.subplots()\n"
+        "ax.plot([1, 2], [2, 1])\n"
+        "def _boom(*a, **kw):\n"
+        "    raise RuntimeError('render boom')\n"
+        "fig.savefig = _boom\n"
+    )
+    result = _run(executor, code)
+
+    assert result["error"] is True
+    assert result["chart_base64"] is None
+    assert "__CHART_RENDER_ERROR__" in result["stderr"]
+    assert "render boom" in result["stderr"]
 
