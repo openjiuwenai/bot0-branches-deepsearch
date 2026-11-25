@@ -150,16 +150,31 @@ def test_split_report_by_h1_unclosed_fence_falls_back_to_plain_text():
     assert sections[1]["content"] == "正文二"
 
 
-def test_split_report_by_h1_keeps_titled_first_h1_with_long_body():
-    """首个 H1 没有章节号，但下面已是成段正文，说明它是正文首章而非总标题。"""
+def test_split_report_by_h1_drops_title_before_numbered_chapters_with_long_intro():
+    """总标题 + 长导语 + 编号章节：按"后续章节已带编号"判为总标题。
+
+    此前用"正文不超过 200 字"兜底，一段长导语就让总标题被当成正文首章，
+    后面章节整体后移一章，图表任务按章节索引取资料时错位到下一章、
+    最后一章还会因索引越界直接失败。
+    """
     report = (
-        "# 背景与现状\n\n"
-        + "这是一段正文。" * 60
-        + "\n\n# 1. 第一章\n\n正文一\n"
+        "# Industry report\n\n"
+        + "导语内容。" * 60
+        + "\n\n# 1. Market\n\n市场正文\n\n# 2. Outlook\n\n展望正文\n"
     )
     sections = FigurePlaceholderGenerator._split_report_by_h1(report)
 
-    assert [section["title"] for section in sections] == ["背景与现状", "1. 第一章"]
+    assert [section["title"] for section in sections] == ["1. Market", "2. Outlook"]
+    assert [section["index"] for section in sections] == [1, 2]
+
+
+def test_split_report_by_h1_keeps_first_chapter_without_structural_marker():
+    """既无编号章节也无前言的输入：首个 H1 按正文首章保留，不能整章丢掉。"""
+    report = "# Background\n\nOrders grew by 20%.\n\n# Outlook\n\n展望正文\n"
+    sections = FigurePlaceholderGenerator._split_report_by_h1(report)
+
+    assert [section["title"] for section in sections] == ["Background", "Outlook"]
+    assert sections[0]["content"] == "Orders grew by 20%."
 
 
 def test_split_report_by_h1_drops_numbered_title_with_toc_body():
@@ -213,3 +228,55 @@ def test_split_report_by_h1_ignores_indented_fence_as_code_block():
 
     assert [section["title"] for section in sections] == ["1. 第一章", "2. 第二章"]
     assert sections[1]["content"] == "正文二\n    ```"
+
+
+def test_split_section_by_h2_keeps_indented_first_line():
+    """首章正文以 4 空格缩进的字面量 ~~~ 开头时，后面的真实 H2 仍要被切出来。
+
+    直接对 H1 切片做 .strip() 会吃掉首行缩进，缩进代码块里的 ~~~ 就变成真正的
+    开围栏，把 ``## 1.1 Demand`` 及正文一起吞进代码块。
+    """
+    report = (
+        "# 1. Benchmark\n\n"
+        "    ~~~\n\n"
+        "## 1.1 Demand\n\n需求正文\n\n"
+        "```text\n示例\n```\n\n"
+        "## 1.2 Outlook\n\n展望正文\n\n"
+        "# 2. Results\n\n结果正文\n"
+    )
+    sections = FigurePlaceholderGenerator._split_report_by_h1(report)
+    sub_sections = FigurePlaceholderGenerator._split_section_by_h2(sections[0])
+
+    assert [sub["title"] for sub in sub_sections] == ["1.1 Demand", "1.2 Outlook"]
+    assert "需求正文" in sub_sections[0]["content"]
+
+
+def test_split_report_by_h1_ignores_preface_heading_inside_code_fence():
+    """首章正文里的 Markdown 围栏示例含 ``## Abstract`` 时，整章不能被当前言丢掉。"""
+    report = (
+        "# 1. Benchmark\n\n"
+        "首章正文。\n\n"
+        "```markdown\n## Abstract\n示例内容\n```\n\n"
+        "# 2. Results\n\n结果正文\n"
+    )
+    sections = FigurePlaceholderGenerator._split_report_by_h1(report)
+
+    assert [section["title"] for section in sections] == ["1. Benchmark", "2. Results"]
+    assert sections[0]["content"].startswith("首章正文。")
+
+
+def test_fenced_lines_handles_many_unclosed_fences_linearly():
+    """连续未闭合的围栏起始标记不能退化成二次方扫描（曾 4,000 行耗时约 28 秒）。"""
+    import time
+
+    from openjiuwen_deepsearch.algorithm.chart_generation.figure_placeholders import (
+        _fenced_lines,
+    )
+
+    lines = ["~~~text\n"] * 4000
+    started = time.perf_counter()
+    fenced = _fenced_lines(lines)
+    elapsed = time.perf_counter() - started
+
+    assert fenced == set()
+    assert elapsed < 2.0, f"_fenced_lines took {elapsed:.1f}s for 4000 lines"

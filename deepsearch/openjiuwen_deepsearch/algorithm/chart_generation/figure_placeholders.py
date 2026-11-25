@@ -51,9 +51,6 @@ _EXCLUDED_TITLES = frozenset(
 )
 
 
-# 总标题的正文一般不超过这个长度；超过且不是前言，说明这已经是正文首章
-_FIRST_TITLE_MAX_BODY = 200
-
 # 目录行：标题 + 点线/省略号引导符 + 页码
 _TOC_LINE_RE = re.compile(r"^.{1,80}?(?:\.{3,}|…{2,}|·{3,})\s*\d{1,4}\s*$")
 # 前言小节标题：目录 / 摘要 / Table of Contents ...
@@ -63,6 +60,8 @@ _PREFACE_HEADING_RE = re.compile(
     + r")\s*$",
     re.IGNORECASE,
 )
+# 正文里的章节锚点链接（目录条目）：[第一章](#chapter-1)
+_TOC_LINK_RE = re.compile(r"\]\(#chapter-\d+\)")
 
 
 def _is_preface_body(body: str) -> bool:
@@ -71,32 +70,80 @@ def _is_preface_body(body: str) -> bool:
     报告总标题下面经常跟着目录或摘要，这些内容有固定形态：带点线和页码的目录行，
     或 "目录 / 摘要" 小节标题。据此可以把"总标题 + 前言"和"正文直接从第一章开始"
     区分开，而不必依赖标题有没有章节号。
+
+    围栏代码块里的行必须跳过：首章正文里放一段 Markdown 示例，示例里的
+    ``## Abstract`` 会被当成前言标题，导致整章被当成总标题丢掉。
     """
-    lines = [line.strip() for line in body.splitlines() if line.strip()]
-    if not lines:
+    lines = body.splitlines()
+    fenced = _fenced_lines(lines)
+    candidates = [
+        line.strip()
+        for idx, line in enumerate(lines)
+        if idx not in fenced and line.strip()
+    ]
+    if not candidates:
         return True
-    if any(_PREFACE_HEADING_RE.match(line) for line in lines):
+    if any(_PREFACE_HEADING_RE.match(line) for line in candidates):
         return True
-    toc_lines = sum(1 for line in lines if _TOC_LINE_RE.match(line))
-    return toc_lines >= 2 and toc_lines * 2 >= len(lines)
+    toc_lines = sum(1 for line in candidates if _TOC_LINE_RE.match(line))
+    return toc_lines >= 2 and toc_lines * 2 >= len(candidates)
 
 
-def _looks_like_report_title(block: Dict[str, str], has_following: bool) -> bool:
+def _has_chapter_links(body: str) -> bool:
+    """正文里是否已经有成组的章节锚点链接（生成器写目录时用 ``#chapter-N``）。"""
+    return len(_TOC_LINK_RE.findall(body)) >= 2
+
+
+def _looks_like_report_title(
+    block: Dict[str, str], following_titles: List[str]
+) -> bool:
     """判断首个 H1 是不是整篇报告的总标题。
 
     只看标题形态会两头出错：``# 2025 年行业观察`` 没有章节号，但它可能是正文第一章；
     反过来，大纲标题也可能恰好长成 ``# 1. 2025 年行业观察``。所以按结构信号判断：
-    后面还有别的 H1，且正文为空、是目录/摘要这种前言、或短到不成段，才算总标题。
-    标题形态只在"正文极短又不像前言"时兜底：带章节号的仍当正文首章保留。
+
+    * 正文为空、是目录/摘要这类前言、或正文里已经成组出现章节锚点链接 → 总标题；
+    * 紧随其后的 H1 已经是带编号的章节（``1.`` / ``第一章``）→ 编号从那一章开始，
+      当前位置只能是总标题，**与导语长短无关**。此前用"正文不超过 200 字"兜底，
+      一段长导语就让总标题被当成正文首章，后面的章节整体后移一章，图表任务按
+      章节索引取资料时错位到下一章、最后一章还会因索引越界直接失败；
+    * 以上结构标记都没有（如 ``# Background`` 只有一句正文、后面接 ``# Outlook``）
+      → 按正文首章保留，丢掉它等于整章内容蒸发。
     """
-    if not has_following:
+    if not following_titles:
         return False
     body = (block.get("content") or "").strip()
-    if _is_preface_body(body):
+    if _is_preface_body(body) or _has_chapter_links(body):
         return True
     if _CHAPTER_TITLE_RE.match(block.get("title") or ""):
         return False
-    return len(body) <= _FIRST_TITLE_MAX_BODY
+    return bool(_CHAPTER_TITLE_RE.match(following_titles[0]))
+
+
+def _close_length_suffix_max(
+    lines: List[str], ignored: "set[int]", char: str
+) -> List[int]:
+    """后缀最大闭合长度：``result[i]`` 是 i..末尾里可用作闭合围栏的最大长度。
+
+    只需 O(1) 就能判断"从这里往后根本没有闭合围栏"，这是把未闭合围栏的回退
+    从二次方扫描降成线性的关键。
+    """
+    result = [-1] * (len(lines) + 1)
+    for idx in range(len(lines) - 1, -1, -1):
+        result[idx] = result[idx + 1]
+        if idx in ignored:
+            continue
+        match = _FENCE_LINE_RE.match(lines[idx].rstrip("\r\n"))
+        if not match:
+            continue
+        fence = match.group("fence")
+        if (
+            fence[0] == char
+            and not match.group("info").strip()
+            and len(fence) > result[idx]
+        ):
+            result[idx] = len(fence)
+    return result
 
 
 def _scan_fences(lines: List[str], ignored: "set[int]") -> Tuple["set[int]", int]:
@@ -106,6 +153,12 @@ def _scan_fences(lines: List[str], ignored: "set[int]") -> Tuple["set[int]", int
     也不允许带 info string；开启行的 info string 里出现反引号时不是围栏。
     """
     fenced: "set[int]" = set()
+    # 后续不存在可用闭合围栏的"起始标记"直接按普通文本跳过：此前每遇到一个
+    # 这样的标记就要从文件头重扫全文（连续 4,000 行 ~~~text 实测约 28 秒）。
+    close_len = {
+        "`": _close_length_suffix_max(lines, ignored, "`"),
+        "~": _close_length_suffix_max(lines, ignored, "~"),
+    }
     open_char = ""
     open_len = 0
     open_idx = -1
@@ -119,6 +172,8 @@ def _scan_fences(lines: List[str], ignored: "set[int]") -> Tuple["set[int]", int
         char, length = fence[0], len(fence)
         if not open_char:
             if char == "`" and "`" in match.group("info"):
+                continue
+            if close_len[char][idx + 1] < length:
                 continue
             open_char, open_len, open_idx = char, length, idx
         elif char == open_char and length >= open_len and not match.group("info").strip():
@@ -141,6 +196,16 @@ def _fenced_lines(lines: List[str]) -> "set[int]":
         ignored.add(unclosed)
 
 
+def _slice_block_content(content: str, start: int, end: int) -> str:
+    """切出章节正文：只去掉标题行之后的空行，**保留首行缩进**。
+
+    直接用 ``.strip()`` 会把首行的缩进一起吃掉。4 个空格在 Markdown 里是
+    缩进代码块，缩进一消失，本应只是字面量的 ``~~~`` 就变成真正的开围栏，
+    把后面的 ``## 1.1`` 及正文全吞进代码块，H2 定位整段失效。
+    """
+    return content[start:end].lstrip("\r\n").rstrip()
+
+
 def _split_by_heading(content: str, pattern: "re.Pattern[str]") -> List[Dict[str, str]]:
     """按标题行切分 *content*，返回 ``[{"title", "content"}, ...]``。
 
@@ -161,13 +226,17 @@ def _split_by_heading(content: str, pattern: "re.Pattern[str]") -> List[Dict[str
         match = pattern.match(line.rstrip("\r\n"))
         if match:
             if current is not None:
-                current["content"] = content[current.pop("_start"):offset].strip()
+                current["content"] = _slice_block_content(
+                    content, current.pop("_start"), offset
+                )
             current = {"title": match.group(1).strip(), "_start": offset + len(line)}
             blocks.append(current)
         offset += len(line)
 
     if current is not None:
-        current["content"] = content[current.pop("_start"):].strip()
+        current["content"] = _slice_block_content(
+            content, current.pop("_start"), len(content)
+        )
 
     return blocks
 
@@ -260,10 +329,12 @@ class FigurePlaceholderGenerator:
             normalized_title = re.sub(r"\s+", " ", section["title"]).strip().casefold()
             if normalized_title in _EXCLUDED_TITLES:
                 continue
-            # 首个 H1 通常是报告标题（不带章节号、正文为空）。若正文直接从
-            # "第一章 / 1." 开始，或该 H1 下面已经是成段正文，说明报告没有总标题，
-            # 此时不能按位置把它当标题丢掉。
-            if position == 0 and _looks_like_report_title(section, len(blocks) > 1):
+            # 首个 H1 要不要当总标题丢掉，按结构信号判断（见
+            # _looks_like_report_title）：后面紧跟的是带编号的章节、或该块正文
+            # 是目录/摘要前言时才算总标题；否则按正文首章保留，不能整章丢失。
+            if position == 0 and _looks_like_report_title(
+                section, [block["title"] for block in blocks[1:]]
+            ):
                 continue
             report_sections.append(section)
 
