@@ -36,25 +36,29 @@ class _ConnectionProxy:
 def test_cache_connections_are_closed(tmp_path, monkeypatch):
     """``with conn`` 只提交不关闭；每次缓存读写都必须真正 close。"""
     closed: list = []
-    real_connect = ApiEmbedder._connect
+    real_connect = sqlite3.connect
 
-    def _tracked_connect(self):
-        return _ConnectionProxy(real_connect(self), closed)
+    def _tracked_connect(*args, **kwargs):
+        return _ConnectionProxy(real_connect(*args, **kwargs), closed)
 
-    monkeypatch.setattr(ApiEmbedder, "_connect", _tracked_connect)
+    monkeypatch.setattr(sqlite3, "connect", _tracked_connect)
 
-    embedder = ApiEmbedder(_settings(tmp_path))
-    embedder._fetch_cached(["a", "b"])
-    embedder._save_cached(["a"], [0], [[1.0]])
+    async def transport(payload):
+        return 200, {"data": [{"index": 0, "embedding": [1.0]}, {"index": 1, "embedding": [2.0]}]}
 
-    # __init__ 建表 1 次 + _fetch_cached 1 次 + _save_cached 1 次
+    embedder = ApiEmbedder(_settings(tmp_path), transport=transport)
+    assert asyncio.run(embedder.async_encode(["a", "b"])) == [[1.0], [2.0]]
+
+    # __init__ 建表 1 次 + 缓存未命中查 1 次 + 写回 1 次
     assert len(closed) == 3
 
 
 def test_out_of_order_response_is_reordered_by_index(tmp_path):
     """响应乱序返回时，向量必须按 index 对齐到请求文本。"""
+    sent: list = []
 
     async def transport(payload):
+        sent.append(list(payload["input"]))
         return 200, {
             "data": [
                 {"index": 2, "embedding": [3.0]},
@@ -67,10 +71,10 @@ def test_out_of_order_response_is_reordered_by_index(tmp_path):
     vectors = asyncio.run(embedder.async_encode(["a", "b", "c"]))
 
     assert vectors == [[1.0], [2.0], [3.0]]
-    # 缓存里也必须按原文本存对，否则二次调用会读到错配向量
-    cached, missing, _ = embedder._fetch_cached(["a", "b", "c"])
-    assert cached == [[1.0], [2.0], [3.0]]
-    assert missing == []
+    # 缓存里也必须按原文本存对：二次调用应全部命中，不再请求服务
+    again = asyncio.run(embedder.async_encode(["a", "b", "c"]))
+    assert again == [[1.0], [2.0], [3.0]]
+    assert sent == [["a", "b", "c"]]
 
 
 def test_missing_index_keeps_response_order(tmp_path):
@@ -84,6 +88,17 @@ def test_missing_index_keeps_response_order(tmp_path):
     assert asyncio.run(embedder.async_encode(["a", "b"])) == [[1.0], [2.0]]
 
 
-def test_ordered_embeddings_handles_non_int_index():
-    items = [{"index": "x", "embedding": [1.0]}, {"index": "y", "embedding": [2.0]}]
-    assert ApiEmbedder._ordered_embeddings(items) == [[1.0], [2.0]]
+def test_non_int_index_keeps_response_order(tmp_path):
+    """index 不是整数时退回数组顺序，不能因类型不符把向量丢掉或错配。"""
+
+    async def transport(payload):
+        return 200, {
+            "data": [
+                {"index": "x", "embedding": [1.0]},
+                {"index": "y", "embedding": [2.0]},
+            ]
+        }
+
+    embedder = ApiEmbedder(_settings(tmp_path), transport=transport)
+
+    assert asyncio.run(embedder.async_encode(["a", "b"])) == [[1.0], [2.0]]
