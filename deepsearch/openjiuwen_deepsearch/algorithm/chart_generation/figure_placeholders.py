@@ -173,7 +173,8 @@ def _scan_fences(lines: List[str], ignored: "set[int]") -> Tuple["set[int]", int
         if not open_char:
             if char == "`" and "`" in match.group("info"):
                 continue
-            if close_len[char][idx + 1] < length:
+            suffix_max = close_len.get(char) or ()
+            if idx + 1 >= len(suffix_max) or suffix_max[idx + 1] < length:
                 continue
             open_char, open_len, open_idx = char, length, idx
         elif char == open_char and length >= open_len and not match.group("info").strip():
