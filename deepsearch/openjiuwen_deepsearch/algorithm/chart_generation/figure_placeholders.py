@@ -62,6 +62,10 @@ _PREFACE_HEADING_RE = re.compile(
 )
 # 正文里的章节锚点链接（目录条目）：[第一章](#chapter-1)
 _TOC_LINK_RE = re.compile(r"\]\(#chapter-\d+\)")
+# 生成器给正文一级章节插入的显式锚点：<a id="chapter-1"></a>
+_CHAPTER_ANCHOR_RE = re.compile(
+    r"""<a\b[^>]*\bid\s*=\s*["']chapter-\d+["']""", re.IGNORECASE
+)
 
 
 def _is_preface_body(body: str) -> bool:
@@ -82,7 +86,11 @@ def _is_preface_body(body: str) -> bool:
         if idx not in fenced and line.strip()
     ]
     if not candidates:
-        return True
+        # 围栏之外没有正文，但代码块本身就是真实内容（例如整章只有一段示例），
+        # 不能当成空前言丢掉；只有围栏也为空时才算前言。
+        return not any(
+            line.strip() for idx, line in enumerate(lines) if idx in fenced
+        )
     if any(_PREFACE_HEADING_RE.match(line) for line in candidates):
         return True
     toc_lines = sum(1 for line in candidates if _TOC_LINE_RE.match(line))
@@ -90,8 +98,17 @@ def _is_preface_body(body: str) -> bool:
 
 
 def _has_chapter_links(body: str) -> bool:
-    """正文里是否已经有成组的章节锚点链接（生成器写目录时用 ``#chapter-N``）。"""
-    return len(_TOC_LINK_RE.findall(body)) >= 2
+    """正文里是否已经有成组的章节锚点链接（生成器写目录时用 ``#chapter-N``）。
+
+    只扫描围栏之外的行：章节正文里的 Markdown 示例常含成对的
+    ``[第一章](#chapter-1)``，把示例当目录会让整章被误判为总标题。
+    """
+    lines = body.splitlines()
+    fenced = _fenced_lines(lines)
+    outside = "\n".join(
+        line for idx, line in enumerate(lines) if idx not in fenced
+    )
+    return len(_TOC_LINK_RE.findall(outside)) >= 2
 
 
 def _looks_like_report_title(
@@ -103,6 +120,7 @@ def _looks_like_report_title(
     反过来，大纲标题也可能恰好长成 ``# 1. 2025 年行业观察``。所以按结构信号判断：
 
     * 正文为空、是目录/摘要这类前言、或正文里已经成组出现章节锚点链接 → 总标题；
+    * 正文自带 ``<a id="chapter-N">`` 章节锚点 → 真实章节，即使下一章带编号；
     * 紧随其后的 H1 已经是带编号的章节（``1.`` / ``第一章``）→ 编号从那一章开始，
       当前位置只能是总标题，**与导语长短无关**。此前用"正文不超过 200 字"兜底，
       一段长导语就让总标题被当成正文首章，后面的章节整体后移一章，图表任务按
@@ -113,6 +131,11 @@ def _looks_like_report_title(
     if not following_titles:
         return False
     body = (block.get("content") or "").strip()
+    # 生成器给正文一级章节打的锚点优先于"下一章带编号"的推断：单凭下一章的
+    # 编号丢弃当前章，会把 ``# Background`` 这类无编号首章吃掉，后面的章节
+    # 整体后移，图表任务按索引取资料时对错章。
+    if _CHAPTER_ANCHOR_RE.search(body):
+        return False
     if _is_preface_body(body) or _has_chapter_links(body):
         return True
     if _CHAPTER_TITLE_RE.match(block.get("title") or ""):

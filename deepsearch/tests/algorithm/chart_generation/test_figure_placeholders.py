@@ -280,3 +280,47 @@ def test_fenced_lines_handles_many_unclosed_fences_linearly():
 
     assert fenced == set()
     assert elapsed < 2.0, f"_fenced_lines took {elapsed:.1f}s for 4000 lines"
+
+
+def test_split_report_by_h1_keeps_anchored_first_chapter_before_numbered_chapter():
+    """首章自带 ``<a id="chapter-1">`` 锚点时，不能因为下一章带编号就当成总标题。"""
+    report = (
+        '# Background\n<a id="chapter-1"></a>\n\n'
+        "引言正文。\n\n"
+        '# 2. Outlook\n<a id="chapter-2"></a>\n\n'
+        "展望正文。\n"
+    )
+    sections = FigurePlaceholderGenerator._split_report_by_h1(report)
+
+    assert [section["title"] for section in sections] == ["Background", "2. Outlook"]
+    assert [section["index"] for section in sections] == [1, 2]
+
+
+def test_split_report_by_h1_ignores_chapter_links_inside_fence():
+    """编号首章里的围栏示例含成对 ``#chapter-N`` 链接时，不能把整章当前言丢掉。"""
+    report = (
+        "# 1. Benchmark\n\n"
+        "示例：\n\n"
+        "```markdown\n"
+        "[第一章](#chapter-1)\n"
+        "[第二章](#chapter-2)\n"
+        "```\n\n"
+        "# 2. Results\n\n结果正文\n"
+    )
+    sections = FigurePlaceholderGenerator._split_report_by_h1(report)
+
+    assert [section["title"] for section in sections] == ["1. Benchmark", "2. Results"]
+    assert "示例：" in sections[0]["content"]
+
+
+def test_split_report_by_h1_keeps_first_chapter_with_only_fenced_body():
+    """首章正文只有围栏代码时是真实内容，不能因为"过滤后没有正文"被当前言丢掉。"""
+    report = (
+        "# 1. Benchmark\n\n"
+        "```python\nprint('only code')\n```\n\n"
+        "# 2. Results\n\n结果正文\n"
+    )
+    sections = FigurePlaceholderGenerator._split_report_by_h1(report)
+
+    assert [section["title"] for section in sections] == ["1. Benchmark", "2. Results"]
+    assert "only code" in sections[0]["content"]
