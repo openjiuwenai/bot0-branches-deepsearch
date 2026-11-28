@@ -1,18 +1,40 @@
 """Tests for :class:`ApiEmbedder` cache lifecycle and vector ordering."""
 
 import asyncio
+import os
 import sqlite3
+from contextlib import closing
 
-from openjiuwen_search_base.embedding.api_embedder import ApiEmbedder, EmbedderSettings
+import pytest
+
+from openjiuwen_search_base.embedding.api_embedder import (
+    ApiEmbedder,
+    EmbedderSettings,
+    EmbeddingRetryError,
+)
 
 
-def _settings(cache_dir) -> EmbedderSettings:
+def _settings(cache_dir, **overrides) -> EmbedderSettings:
     return EmbedderSettings(
         url="https://example.com/v1/embeddings",
         model="test-model",
         api_key=bytearray(),
         cache_dir=str(cache_dir),
+        **overrides,
     )
+
+
+def _cache_rows(cache_dir) -> int:
+    """统计缓存表里的向量条数，用于确认失败批次没有落库。"""
+    db = os.path.join(str(cache_dir), "_emb_test-model.db")
+    with closing(sqlite3.connect(db)) as conn:
+        return conn.execute("SELECT COUNT(*) FROM cache").fetchone()[0]
+
+
+def _fast_fail_settings(cache_dir) -> EmbedderSettings:
+    """关掉退避等待，让契约不一致的响应快速失败。"""
+    return _settings(cache_dir, max_retries=1, retry_backoff_seconds=0.0)
+
 
 
 class _ConnectionProxy:
@@ -89,13 +111,109 @@ def test_missing_index_keeps_response_order(tmp_path):
 
 
 def test_non_int_index_keeps_response_order(tmp_path):
-    """index 不是整数时退回数组顺序，不能因类型不符把向量丢掉或错配。"""
+    """index 全部不是整数时退回数组顺序（视为服务端不发 index）。"""
 
     async def transport(payload):
         return 200, {
             "data": [
                 {"index": "x", "embedding": [1.0]},
                 {"index": "y", "embedding": [2.0]},
+            ]
+        }
+
+    embedder = ApiEmbedder(_settings(tmp_path), transport=transport)
+
+    assert asyncio.run(embedder.async_encode(["a", "b"])) == [[1.0], [2.0]]
+
+
+def test_partial_index_is_rejected(tmp_path):
+    """部分条目带 index、部分不带：契约不一致，不能按数组顺序猜，且不写缓存。"""
+
+    async def transport(payload):
+        return 200, {
+            "data": [
+                {"index": 0, "embedding": [1.0]},
+                {"embedding": [2.0]},
+            ]
+        }
+
+    embedder = ApiEmbedder(_fast_fail_settings(tmp_path), transport=transport)
+
+    with pytest.raises(EmbeddingRetryError):
+        asyncio.run(embedder.async_encode(["a", "b"]))
+    assert _cache_rows(tmp_path) == 0
+
+
+def test_duplicate_index_is_rejected(tmp_path):
+    """index 重复会让一条向量覆盖另一条，必须判失败而不是静默错配。"""
+
+    async def transport(payload):
+        return 200, {
+            "data": [
+                {"index": 0, "embedding": [1.0]},
+                {"index": 0, "embedding": [2.0]},
+            ]
+        }
+
+    embedder = ApiEmbedder(_fast_fail_settings(tmp_path), transport=transport)
+
+    with pytest.raises(EmbeddingRetryError):
+        asyncio.run(embedder.async_encode(["a", "b"]))
+    assert _cache_rows(tmp_path) == 0
+
+
+def test_out_of_range_index_is_rejected(tmp_path):
+    """index 越界说明服务端批次与请求不一致，不能按位置硬塞进结果。"""
+
+    async def transport(payload):
+        return 200, {
+            "data": [
+                {"index": 0, "embedding": [1.0]},
+                {"index": 2, "embedding": [2.0]},
+            ]
+        }
+
+    embedder = ApiEmbedder(_fast_fail_settings(tmp_path), transport=transport)
+
+    with pytest.raises(EmbeddingRetryError):
+        asyncio.run(embedder.async_encode(["a", "b"]))
+    assert _cache_rows(tmp_path) == 0
+
+
+def test_missing_embedding_field_is_rejected(tmp_path):
+    """条目缺 embedding 字段时不抛 KeyError、也不产生错位结果。"""
+
+    async def transport(payload):
+        return 200, {"data": [{"index": 0, "embedding": [1.0]}, {"index": 1}]}
+
+    embedder = ApiEmbedder(_fast_fail_settings(tmp_path), transport=transport)
+
+    with pytest.raises(EmbeddingRetryError):
+        asyncio.run(embedder.async_encode(["a", "b"]))
+    assert _cache_rows(tmp_path) == 0
+
+
+def test_non_list_data_is_rejected(tmp_path):
+    """data 不是数组时直接判失败，不进入缓存写入路径。"""
+
+    async def transport(payload):
+        return 200, {"data": "oops"}
+
+    embedder = ApiEmbedder(_fast_fail_settings(tmp_path), transport=transport)
+
+    with pytest.raises(EmbeddingRetryError):
+        asyncio.run(embedder.async_encode(["a", "b"]))
+    assert _cache_rows(tmp_path) == 0
+
+
+def test_bool_index_falls_back_to_response_order(tmp_path):
+    """bool 是 int 的子类，但不能被当成 0/1；全 bool 视作没有合法 index。"""
+
+    async def transport(payload):
+        return 200, {
+            "data": [
+                {"index": True, "embedding": [1.0]},
+                {"index": False, "embedding": [2.0]},
             ]
         }
 

@@ -158,14 +158,35 @@ class ApiEmbedder:
 
         OpenAI 兼容服务（vLLM、部分自建代理）允许 ``data`` 乱序返回，只保证每条
         带 ``index``；直接按数组顺序 zip 会把向量错配到别的文本上，且不会报错。
-        缺失/非整型的 ``index`` 退回数组顺序，保持与旧行为一致。
+
+        三种情形分别处理：
+
+        * ``index`` 恰好构成 ``0..n-1`` 的全排列：按 ``index`` 定点回填，顺序确定；
+        * 完全没有合法整型 ``index``：退回数组顺序，兼容不发 ``index`` 的服务；
+        * 部分缺失 / 重复 / 越界 / 条目缺 ``embedding``：属于服务端契约不一致，
+          返回空列表让上层长度校验判失败，宁可重试也不把错配向量写进缓存。
         """
-        entries = []
-        for position, item in enumerate(items):
-            index = item.get("index", position)
-            entries.append((index if isinstance(index, int) else position, position, item))
-        entries.sort(key=lambda entry: (entry[0], entry[1]))
-        return [entry[2]["embedding"] for entry in entries]
+        if not isinstance(items, list) or not all(
+            isinstance(item, dict) and "embedding" in item for item in items
+        ):
+            return []
+
+        raw_indices = [item.get("index") for item in items]
+        # bool 是 int 的子类，必须先排除，否则 True/False 会被当成 0/1
+        valid_ints = [
+            idx for idx in raw_indices if isinstance(idx, int) and not isinstance(idx, bool)
+        ]
+
+        if len(valid_ints) == len(items) and set(valid_ints) == set(range(len(items))):
+            ordered: list = [None] * len(items)
+            for idx, item in zip(valid_ints, items):
+                ordered[idx] = item["embedding"]
+            return ordered
+
+        if not valid_ints:
+            return [item["embedding"] for item in items]
+
+        return []
 
     async def async_encode(self, chunks: list[str], is_query: bool = False) -> list[list[float]]:
         # 先构造实际发送文本（前缀+截断），缓存查/存一律以它为键；
@@ -196,7 +217,11 @@ class ApiEmbedder:
                     for idx, emb in zip(missing_indices, vectors):
                         embeddings[idx] = emb
                     return embeddings
-                last_error = f"vector count mismatch: {len(vectors)} != {len(missing_prepared)}"
+                # 空向量列表说明响应条目缺 embedding，或 index 部分缺失/重复/越界
+                last_error = (
+                    f"vector count mismatch or inconsistent index: got {len(vectors)}, "
+                    f"expected {len(missing_prepared)}"
+                )
             else:
                 last_error = f"status={status} body={str(body)[:500]}"
             if attempt + 1 >= self._settings.max_retries:
