@@ -14,6 +14,21 @@ _REF_LINE_RE = re.compile(r"^\[(\d+)\]\s*(.*)$")
 _CITATION_RE = re.compile(r"\[citation:(\d+)\]")
 
 
+def _normalize_ref_no(value) -> str:
+    """把引用编号归一成与 ``ref_map`` 键一致的十进制字符串。
+
+    参考文献写成 ``[02]`` 时映射键是 ``2``；正文 ``[citation:02]`` 若直接用
+    原始字符串 "02" 查找就会落空并改写成 ``[citation:?]``。正文替换、文献
+    解析和资料条目的 index 查找必须共用同一套归一化规则。
+    """
+    text = str(value).strip()
+    try:
+        return str(int(text))
+    except (TypeError, ValueError):
+        return text
+
+
+
 def _deduplicate_and_renumber_refs(
     ref_blocks: list[str],
 ) -> tuple[str, dict[str, int]]:
@@ -101,7 +116,13 @@ def _split_ref_blocks(raw_text: str) -> list[str]:
         current.append(line)
     if current:
         blocks.append(current)
-    return ["\n".join(block) for block in blocks]
+    # 只把含有效引用的块计入段落编号：``## References`` 与 ``[1]`` 之间有空行
+    # 时，标题会被空行切成单独一块，段落号整体后移，后续映射键全部错位。
+    return [
+        "\n".join(block)
+        for block in blocks
+        if any(_REF_LINE_RE.match(line.strip()) for line in block)
+    ]
 
 
 def _deduplicate_and_renumber_ref(raw_text: str) -> tuple[str, dict[str, int]]:
@@ -121,6 +142,29 @@ def _paragraph_ref_map(ref_map: dict[str, int], paragraph_no: int) -> dict[str, 
         for key, value in ref_map.items()
         if key.startswith(prefix)
     }
+
+
+def _clear_skipped_sections(
+    classified_contents: list[list[dict]],
+    section_indexes: list[int] | None,
+) -> list[list[dict]]:
+    """让未进入报告的章节资料退出全局引用映射。
+
+    报告组装会跳过正文为空的章节，但这些章节的资料仍留在列表里。下游按
+    ``content["index"]`` 建全局引用映射时先读到它们：被跳过章节的资料 A 占住
+    编号 1，进入报告的第二章里编号同样从 1 开始的资料 B 只能并到 A 上，
+    最终引用链接指向 A。
+
+    列表长度保持不变（图表数据收集/溯源推理按章节下标取资料），只把未进入
+    报告的章节置空；为 ``None`` 时沿用旧的"下标一一对齐"语义。
+    """
+    if section_indexes is None or not classified_contents:
+        return classified_contents
+    kept = set(section_indexes)
+    return [
+        list(items) if index in kept else []
+        for index, items in enumerate(classified_contents)
+    ]
 
 
 def _replace_citations_and_classified_index(
@@ -156,7 +200,7 @@ def _replace_citations_and_classified_index(
         para_map = _paragraph_ref_map(ref_map, paragraph_no)
 
         def _replace(match, _map=para_map, _para_no=paragraph_no):
-            new_index = _map.get(match.group(1))
+            new_index = _map.get(_normalize_ref_no(match.group(1)))
             if new_index is None:
                 unresolved.append((_para_no, match.group(0)))
                 return "[citation:?]"
@@ -181,7 +225,7 @@ def _replace_citations_and_classified_index(
         updated_sub_classified_content: list[dict] = []
         for item in sub_classified_contents:
             updated_item = item.copy()
-            final_index = para_map.get(str(item["index"]))
+            final_index = para_map.get(_normalize_ref_no(item["index"]))
             if final_index is not None:
                 updated_item["index"] = final_index
             updated_sub_classified_content.append(updated_item)
@@ -237,6 +281,9 @@ class ReferenceMixin:
             )
             if not LogManager.is_sensitive():
                 logger.info("refreshed_references: [%s]", refreshed_references)
+            all_classified_contents = _clear_skipped_sections(
+                all_classified_contents or [], section_indexes
+            )
             sub_reports_content, all_classified_contents = (
                 _replace_citations_and_classified_index(
                     sub_reports_content,

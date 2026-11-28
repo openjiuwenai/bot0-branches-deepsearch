@@ -273,3 +273,39 @@ def test_deduplicate_and_renumber_ref_keeps_reference_title_block():
     result, mapping = _deduplicate_and_renumber_ref(text)
     assert result == "[1] A\n\n[2] B"
     assert mapping == {"1-1": 1, "1-2": 2}
+
+
+def test_deduplicate_and_renumber_ref_ignores_blank_line_after_title():
+    """标题与首条文献之间有空行时，标题块不能占用段落号。"""
+    text = "## References\n\n[1] A\n[2] B"
+    result, mapping = _deduplicate_and_renumber_ref(text)
+    assert result == "[1] A\n\n[2] B"
+    assert mapping == {"1-1": 1, "1-2": 2}
+
+
+def test_replace_citations_normalizes_leading_zero_marker():
+    """正文 [citation:02] 与文献 [02] 用同一套数字归一化规则。"""
+    ref_map = {"1-1": 1, "1-2": 2}
+    updated_paragraphs, updated_classified = _replace_citations_and_classified_index(
+        ["P0 [citation:01] and [citation:02]"],
+        [[{"index": "02", "content": "C"}]],
+        ref_map,
+    )
+
+    assert updated_paragraphs == ["P0 [citation:1] and [citation:2]"]
+    assert updated_classified == [[{"index": 2, "content": "C"}]]
+
+
+def test_refresh_reference_drops_docs_of_skipped_section():
+    """被跳过章节的资料必须退出全局引用映射，否则会抢走编号 1。"""
+    result = Reporter.refresh_reference(
+        ["Ch2 [citation:1]"],
+        ["[1] B"],
+        [[{"index": 1, "content": "A"}], [{"index": 1, "content": "B"}]],
+        [1],
+    )
+
+    assert result["sub_reports_content"] == "Ch2 [citation:1]"
+    refreshed = result["refreshed_all_classified_contents"]
+    assert refreshed[0] == []
+    assert [item["content"] for item in refreshed[1]] == ["B"]
