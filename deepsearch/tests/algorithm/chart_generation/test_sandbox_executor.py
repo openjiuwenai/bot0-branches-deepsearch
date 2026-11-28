@@ -264,3 +264,82 @@ def test_render_failure_is_reported_as_error(executor):
     assert "__CHART_RENDER_ERROR__" in result["stderr"]
     assert "render boom" in result["stderr"]
 
+
+def test_os_open_with_bytes_path_keeps_filesystem_path_protocol(executor):
+    """bytes 路径不能先 str() 再打开：否则会创建名为 b'xxx' 的文件。
+
+    路径校验与底层打开必须使用同一个对象；``str(b"data.txt")`` 得到的是
+    ``"b'data.txt'"``，旧实现会把它当成真实文件名写到另一个文件里。
+    """
+    name = "_sandbox_bytes_path.txt"
+    target = Path(executor.working_dir) / name
+    target.unlink(missing_ok=True)
+    code = (
+        "import os\n"
+        f"fd = os.open({name!r}.encode(), os.O_WRONLY | os.O_CREAT)\n"
+        "os.write(fd, b'ok')\n"
+        "os.close(fd)\n"
+        "print('wrote')\n"
+    )
+    result = _run(executor, code)
+
+    assert result["error"] is False, result["stderr"]
+    assert target.read_text(encoding="utf-8") == "ok"
+    assert not (Path(executor.working_dir) / ("b'" + name + "'")).exists()
+
+
+def test_hardlink_to_readonly_asset_is_denied(executor):
+    """硬链接与源文件共享 inode，给只读资产建链等于给出一个可写名字。
+
+    因此 ``os.link`` 的 src 必须位于可写白名单内，不能只要求"可读"。
+    """
+    link = Path(executor.working_dir) / "_sandbox_hardlink_os.py"
+    code = (
+        "import os\n"
+        f"os.link(os.__file__, {_lit(link)})\n"
+        "print('linked')\n"
+    )
+    result = _run(executor, code)
+
+    assert result["error"] is True
+    assert "PermissionError" in result["stderr"]
+    assert not link.exists()
+
+
+def test_hardlink_inside_workdir_is_still_allowed(executor):
+    """可写目录内的硬链接不能误伤。"""
+    code = (
+        "import os\n"
+        "open('_sandbox_hardlink_src.txt', 'w').write('ok')\n"
+        "os.link('_sandbox_hardlink_src.txt', '_sandbox_hardlink_dst.txt')\n"
+        "print(open('_sandbox_hardlink_dst.txt').read())\n"
+    )
+    result = _run(executor, code)
+
+    if result["error"] is True and "WinError" in result["stderr"]:
+        pytest.skip("filesystem cannot create hard links")
+    assert result["error"] is False, result["stderr"]
+    assert "ok" in result["stdout"]
+
+
+def test_remove_acts_on_symlink_entry_not_its_target(executor):
+    """删除类操作作用于目录项本身，不能因为目标在白名单外就改成删目标。"""
+    secret = OUTSIDE_DIR / "_sandbox_remove_target.txt"
+    link = Path(executor.working_dir) / "_sandbox_remove_link"
+    secret.write_text("keep me\n", encoding="utf-8")
+    try:
+        os.symlink(str(OUTSIDE_DIR), str(link), target_is_directory=True)
+    except (OSError, NotImplementedError) as exc:  # pragma: no cover - 环境不支持
+        secret.unlink(missing_ok=True)
+        pytest.skip(f"cannot create symlink: {exc}")
+    try:
+        code = "import os\nos.remove('_sandbox_remove_link')\nprint('removed')\n"
+        result = _run(executor, code)
+
+        assert result["error"] is False, result["stderr"]
+        assert not link.exists()
+        assert secret.exists()
+    finally:
+        link.unlink(missing_ok=True)
+        secret.unlink(missing_ok=True)
+

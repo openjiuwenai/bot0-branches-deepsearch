@@ -485,9 +485,33 @@ def _real(_p):
     abspath 只做字符串拼接、不展开符号链接，因此"先 os.symlink("/etc", "d")，
     再 open("d/hostname")"这类两行代码即可让 abspath 落在工作目录内从而放行，
     而内核跟随符号链接后实际打开的是 /etc/hostname。白名单必须比较 realpath。
+
+    返回值保留入参的路径类型（str / bytes）：路径协议允许 bytes，若这里用
+    ``str()`` 归一化再交给 open()，``os.open(b"data.txt")`` 会真的创建一个名为
+    ``b'data.txt'`` 的文件——被校验的目标和实际写入的目标变成两个对象。
     """
-    _rp = os.path.realpath(os.path.abspath(str(_p)))
+    _path = os.fspath(_p)
+    if isinstance(_path, bytes):
+        # bytes 相对路径不能用 str 类型的 cwd 拼接（TypeError: Can't mix
+        # strings and bytes），先按 bytes 形式的 cwd 补全。
+        _path = os.path.join(os.getcwdb(), _path)
+    _rp = os.path.realpath(os.path.abspath(_path))
     return os.path.normcase(_rp) if os.name == "nt" else _rp
+
+
+def _real_entry(_p):
+    """解析"目录项"本身：只展开父目录的符号链接，保留最后一段不跟随。
+
+    删除/改名/建目录等操作作用于目录项而不是它指向的文件：``os.remove("link")``
+    删除的是链接本身。若这里也做 realpath，就会变成删除链接指向的目标；
+    而完全不解析父目录又会让 ``..`` 或父级链接把操作带到白名单外。
+    """
+    _path = os.fspath(_p)
+    if isinstance(_path, bytes):
+        _path = os.path.join(os.getcwdb(), _path)
+    _parent, _name = os.path.split(_path)
+    _real_parent = _real(_parent if _parent else os.curdir)
+    return os.path.join(_real_parent, _name)
 
 
 # 白名单目录本身也按真实路径归一化（macOS 的 tmpdir、Windows 的大小写/8.3 名）
@@ -521,9 +545,20 @@ def _deny_read(_abs, file):
 def _check_write(file, what="Writing"):
     """写入/删除类操作统一校验：只允许工作目录与临时目录。"""
     _abs = _real(file)
-    if not _is_under(_abs, _write_dirs):
+    if not _is_under(os.fsdecode(_abs), _write_dirs):
         raise PermissionError(
-            f"{what} to '{file}' is not allowed. "
+            f"{what} to '{os.fsdecode(file)}' is not allowed. "
+            f"Sandbox writes restricted to: {_write_dirs}"
+        )
+    return _abs
+
+
+def _check_write_entry(file, what="Writing"):
+    """写目录项（删除/改名/建目录）的校验：只展开父目录，保留最后一段。"""
+    _abs = _real_entry(file)
+    if not _is_under(os.fsdecode(_abs), _write_dirs):
+        raise PermissionError(
+            f"{what} to '{os.fsdecode(file)}' is not allowed. "
             f"Sandbox writes restricted to: {_write_dirs}"
         )
     return _abs
@@ -532,8 +567,9 @@ def _check_write(file, what="Writing"):
 def _check_read(file):
     """读取类操作统一校验，返回解析后的真实路径。"""
     _abs = _real(file)
-    if not _is_under(_abs, _read_dirs):
-        _deny_read(_abs, file)
+    _key = os.fsdecode(_abs)
+    if not _is_under(_key, _read_dirs):
+        _deny_read(_key, os.fsdecode(file))
     return _abs
 
 
@@ -648,7 +684,27 @@ _PATH_OP_SPECS = {
     # symlink/link 的 src 是之后会被读取的真实目标：只校验 dst 等于允许在沙箱内
     # 挂一个指向 /etc 的链接，再 open("link/hostname") 即绕过读取白名单。
     "symlink": (("src", "dst", "target_is_directory"), ("dir_fd",), ("dst",), ("src",)),
-    "link": (("src", "dst"), ("src_dir_fd", "dst_dir_fd"), ("dst",), ("src",)),
+    # link 的两个名字共享同一个 inode：src 只要可读就能在写目录里建出一个可写
+    # 名字，进而改写只读资产（/usr/share 下的文件、字体等）。因此硬链接的源
+    # 必须本身位于可写白名单内，不能只要求"可读"。
+    "link": (("src", "dst"), ("src_dir_fd", "dst_dir_fd"), ("src", "dst"), ()),
+}
+
+
+# 该操作作用于目录项本身（不跟随最后一段的符号链接）还是其指向的目标。
+# None 表示由 follow_symlinks 参数决定（chmod/utime）。
+_FOLLOW_FINAL = {
+    "remove": False,
+    "unlink": False,
+    "rmdir": False,
+    "removedirs": False,
+    "mkdir": False,
+    "makedirs": False,
+    "rename": False,
+    "renames": False,
+    "replace": False,
+    "chmod": None,
+    "utime": None,
 }
 
 
@@ -660,11 +716,32 @@ def _make_path_guard(_fn_name, _orig_fn, _spec):
         _bound = _bind_path_call(
             _fn_name, _pos_names, _kwonly_names, _required_names, a, kw
         )
+        _follow = _FOLLOW_FINAL.get(_fn_name, True)
+        if _follow is None:
+            _follow = _bound.get("follow_symlinks", True) is not False
+        _check_write_fn = _check_write if _follow else _check_write_entry
+        _resolved = {}
         for _name in _write_names:
-            _check_write(_bound[_name], what=_fn_name)
+            _resolved[_name] = _check_write_fn(_bound[_name], what=_fn_name)
         for _name in _read_names:
-            _check_read(_bound[_name])
-        return _orig_fn(*a, **kw)
+            _resolved[_name] = _check_read(_bound[_name])
+        # 授权与操作必须落在同一个对象上：此前校验完用户给的字符串、底层再按
+        # 原始参数重新解析，两步之间把路径换成指向白名单外的符号链接即可绕过。
+        # 这里把校验得到的路径直接交给底层调用（目录项操作保留最后一段名字，
+        # 只固定父目录），使"校验的对象"和"操作的对象"是同一个路径。
+        _skip = set()
+        # symlink 的 src 只是"以后再解析"的目标规格，改成绝对路径会改变链接语义。
+        if _fn_name == "symlink":
+            _skip.add("src")
+        _new_a = list(a)
+        for _i, _name in enumerate(_pos_names[:len(_new_a)]):
+            if _name in _resolved and _name not in _skip:
+                _new_a[_i] = _resolved[_name]
+        _new_kw = dict(kw)
+        for _name, _value in _resolved.items():
+            if _name in _new_kw and _name not in _skip:
+                _new_kw[_name] = _value
+        return _orig_fn(*_new_a, **_new_kw)
 
     _guarded.__name__ = _fn_name
     return _guarded
